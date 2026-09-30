@@ -1,0 +1,84 @@
+# calls + process. The first call is a range query (probe latency), the
+# second an instant subquery (failed probe samples in the same window) with a
+# per-call jq. A `fn: jq` step selects the latency input for the anomaly
+# detector; the render reads the second call through `result`. The minimum
+# slowdown is the processor's min_delta (seconds above the mean): a filter on
+# the latency level would keep a slow service getting slightly slower and
+# drop a fast one that became several times slower. Assumes blackbox_exporter
+# scraped as job="blackbox" with a `service` label.
+name: probe_latency_anomalies
+description: |
+  Blackbox probe latency anomalies per monitored service over the `range`
+  ending at `at`: probe_duration_seconds scored as a z-score against the
+  service's own history in the window (upward deviations only) and kept
+  only if the latency rose at least `min_ms` above the service's mean,
+  plus how many probe samples failed in the same window. Returns, per service with
+  anomalies, the mean and stddev latency and the strongest anomalies with
+  time, latency and score; then the list of services with failed probes.
+params:
+  service:   {type: string, default: ".*", description: "Regex over the service label, e.g. api|web"}
+  at:        {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:     {type: string, default: "12h", description: "Look-back range ending at `at`", pattern: "^[0-9]+[smhdwy]$"}
+  step:      {type: string, default: "60s", description: "Sample resolution", pattern: "^[0-9]+[smhdwy]$"}
+  threshold: {type: number, default: 3, minimum: 0.5, maximum: 10, description: "z-score threshold"}
+  min_ms:    {type: number, default: 50, minimum: 0, maximum: 60000, description: "Smallest slowdown worth reporting: ms above the service's mean latency (a 10 ms probe jumping to 30 ms is statistically extreme but harmless)"}
+
+calls:
+  - name: latency
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        probe_duration_seconds{job="blackbox", service=~{{ promLabel .service }}}
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: failures
+    worker: prometheus
+    request:
+      type: instant
+      query: |
+        sum by (service) (
+          sum_over_time((1 - probe_success{job="blackbox", service=~{{ promLabel .service }}})[{{ promDuration .range }}:{{ promDuration .step }}])
+        ) > 0
+      time: "{{ .at }}"
+    jq: '[.result[] | {service: .metric.service, failed_samples: (.value[1] | tonumber)}] | sort_by(-.failed_samples)'
+
+process:
+  - fn: jq
+    with:
+      expr: '.latency'
+  - fn: anomaly
+    with:
+      method: zscore
+      threshold: "{{ .threshold }}"
+      direction: up
+      min_points: 30
+      min_delta: "{{ divf .min_ms 1000 }}"   # seconds above the mean; applied before the cap
+      max_anomalies: 5               # the five strongest per service, in time order
+
+response:
+  jq: |
+    [ .series[] | select(.skipped | not) | select(.anomaly_count > 0)
+      | {service: .metric.service, points, count: .anomaly_count,
+         mean_ms: (.stats.mean * 1000), stddev_ms: (.stats.stddev * 1000), max_ms: (.stats.max * 1000),
+         anomalies: [.anomalies[] | {time, ms: (.value * 1000), score}]}
+    ] as $svcs
+    | {
+      at: $params.at, range: $params.range,
+      services_total: .series_total, services_analyzed: .series_analyzed,
+      raw_total: (.total_anomalies + ([.series[].below_min_delta // 0] | add // 0)),
+      total: .total_anomalies,
+      services: ($svcs | sort_by(-.count, -.max_ms))
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No probe latency anomalies of {{ param "min_ms" }}+ ms above the mean for {{ .services_analyzed }} service(s) over the {{ param "range" }} ending at {{ .at }} (z > {{ param "threshold" }}; {{ .raw_total }} smaller deviation(s) ignored).{{ else }}
+    {{ .total }} latency anomaly(ies) of {{ param "min_ms" }}+ ms above the mean in {{ len .services }} of {{ .services_analyzed }} service(s) over the {{ param "range" }} ending at {{ .at }} (z-score > {{ param "threshold" }}, upward only; {{ .raw_total }} raw deviation(s)):
+    {{ range .services }}{{ .service }}: {{ .count }} anomaly(ies), mean {{ printf "%.0f" (float64 .mean_ms) }} ms, stddev {{ printf "%.0f" (float64 .stddev_ms) }} ms, max {{ printf "%.0f" (float64 .max_ms) }} ms
+    {{ range .anomalies }}  - {{ .time }} {{ printf "%.0f" (float64 .ms) }} ms (z = {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}{{ end }}
+    {{- with result "failures" }}
+    Failed probe samples in the same window: {{ range $i, $f := . }}{{ if $i }}, {{ end }}{{ $f.service }} ({{ printf "%.0f" (float64 $f.failed_samples) }} of ~{{ div (promDurationSeconds (param "range")) (promDurationSeconds (param "step")) }}){{ end }}
+    {{- else }}
+    No failed probes in the same window.
+    {{- end }}

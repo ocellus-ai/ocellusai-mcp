@@ -1,0 +1,69 @@
+# ssa example — one range query, Singular Spectrum Analysis of every VM's
+# CPU on its own (trend, cycles, noise), a forecast of the structure and a
+# level-2 response.
+name: vm_cpu_forecast
+description: |
+  Decomposes the CPU busy % of each VM (node exporter instance) over the last
+  `range` into a trend, cycles (daily, its harmonics, weekly) and noise by
+  Singular Spectrum Analysis, and forecasts the structure `horizon` ahead.
+  Returns per VM what the structure is (the trend and its drift, the cycles
+  with their periods and swings), the noise level, how much of the movement
+  the structure explains, warnings about the window or the history, and the
+  forecast: its lowest and highest value, when the peak comes and the value
+  at the end. Set `window` to a multiple of the main period (1d for a daily
+  cycle) and query at least three periods of history; `groups` (e.g. 0;1-2)
+  keeps and forecasts only those components.
+params:
+  instance: {type: string, default: ".*", description: "Regex over the instance label, e.g. vm-1.*:9100"}
+  range:    {type: string, default: "7d", pattern: "^[0-9]+[smhdwy]$", description: "Look-back range, at least three periods of the main cycle"}
+  step:     {type: string, default: "5m", pattern: "^[0-9]+[smhdwy]$", description: "Sample resolution such as 1m, 5m"}
+  window:   {type: string, default: "1d", pattern: "^[0-9]+[smhdwy]$", description: "SSA window, a multiple of the main period"}
+  horizon:  {type: string, default: "1d", pattern: "^[0-9]+[smhdwy]$", description: "How far ahead to forecast"}
+  method:   {type: string, default: "L", enum: ["L", "K"], description: "Forecast method: L recurrent, K vector"}
+  groups:   {type: string, default: "", pattern: "^[0-9,; -]*$", description: "Components to keep and forecast, e.g. 0;1-2 (default: every structure component)"}
+  top:      {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many VMs to list"}
+
+worker: prometheus
+request:
+  type: range
+  query: |
+    100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", instance=~{{ promLabel .instance }}}[5m])))
+  start: "now-{{ promDuration .range }}"
+  end: now
+  step: "{{ .step }}"
+
+process:
+  - fn: ssa
+    with:
+      window: "{{ .window }}"        # points or a duration; resolved at the series' step
+      forecast: "{{ .horizon }}"
+      method: "{{ .method }}"
+      groups: "{{ .groups }}"        # empty: the suggested groups, the structure is forecast
+      clip: [0, 100]                 # a percentage: groups and forecasts with the level stay in range
+      min_points: 100
+
+response:
+  jq: |
+    {
+      analyzed: .series_analyzed,
+      skipped: [ .series[] | select(.skipped) | {instance: .labels.instance, reason} ],
+      vms: [ .series[] | select(.skipped | not)
+             | {instance: .labels.instance, window, noise_sd: .noise.sd,
+                structure: [ .components[] | select(.borderline | not) | "\(.group): \(.meaning)" ],
+                groups: [ .groups[] | {group, kind, drift, peak_to_peak} ],
+                explained: .residual.explained,
+                warnings: [ .findings[] | select(.level == "warn") | .text ],
+                forecast: (.forecast | if .points then
+                             {group, end_time, last: .points[-1][1], warning: (.warning // ""),
+                              low: (.points | map(.[1]) | min),
+                              peak: (.points | max_by(.[1]) | {value: .[1], time: (.[0] | todate)})}
+                           else {reason} end)} ]
+           | .[:$params.top]
+    }
+  render: |
+    {{ .analyzed }} VM(s) analyzed over the last {{ param "range" }} (window {{ param "window" }}, forecast {{ param "horizon" }} ahead, method {{ param "method" }}){{ if .skipped }}; skipped: {{ range $i, $s := .skipped }}{{ if $i }}, {{ end }}{{ .instance }} ({{ .reason }}){{ end }}{{ end }}.
+    {{ range .vms }}{{ .instance }}: {{ join "; " .structure }}. Noise sigma {{ printf "%.2f" (float64 .noise_sd) }}, the structure explains {{ printf "%.0f" (mulf 100 (float64 .explained)) }}% of the movement.
+    {{ with .forecast }}{{ if hasKey . "reason" }}  forecast: {{ .reason }}{{ else }}  forecast of {{ .group }} to {{ .end_time }}: {{ printf "%.1f" (float64 .low) }}..{{ printf "%.1f" (float64 .peak.value) }}%, peak at {{ .peak.time }}, {{ printf "%.1f" (float64 .last) }}% at the end{{ if .warning }}
+      warning: {{ .warning }}{{ end }}{{ end }}{{ end }}
+    {{ range .warnings }}  warning: {{ . }}
+    {{ end }}{{ end }}

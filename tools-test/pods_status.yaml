@@ -1,0 +1,23 @@
+# Shell worker, level 1: kubectl JSON output filtered with jq.
+name: pods_status
+description: |
+  Pods in a namespace with their phase and total restart count.
+  Returns [{"name","phase","restarts"}].
+worker: shell
+
+params:
+  namespace: {type: string, required: true, description: "Kubernetes namespace"}
+
+request:
+  command: kubectl
+  args: [get, pods, -n, "{{ .namespace }}", -o, json]
+  parse: json
+  timeout: 20s
+
+response:
+  jq: |
+    [.items[] | {
+      name: .metadata.name,
+      phase: .status.phase,
+      restarts: ([.status.containerStatuses[]?.restartCount] | add // 0)
+    }]

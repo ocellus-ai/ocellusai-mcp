@@ -1,0 +1,52 @@
+# process: example — a range query, an outlier detector (IQR fences) over every
+# pod's series and a level-2 response over the detector report.
+name: pod_cpu_anomalies
+description: |
+  Finds CPU usage anomalies per pod in a namespace over the last `range`:
+  samples outside the interquartile (Tukey) fences of the pod's own history.
+  Returns, per pod with anomalies, how many samples were anomalous, the
+  expected (median) CPU in cores and the most significant anomalies with time,
+  value, direction (up/down) and score. Use it to spot pods with unusual CPU
+  spikes or drops; lower `sensitivity` to catch more, raise it to keep only
+  extreme ones.
+worker: prometheus
+
+params:
+  namespace:   {type: string, required: true, description: "Kubernetes namespace"}
+  range:       {type: string, default: "2h", description: "Look-back range such as 1h, 6h", pattern: "^[0-9]+[smhdwy]$"}
+  step:        {type: string, default: "60s", description: "Sample resolution such as 30s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  sensitivity: {type: number, default: 1.5, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k: 1.5 = standard outliers, 3 = only extreme ones"}
+
+request:
+  type: range
+  query: |
+    sum by (pod) (rate(container_cpu_usage_seconds_total{namespace={{ promLabel .namespace }}, container!=""}[5m]))
+  start: "now-{{ promDuration .range }}"
+  end: now
+  step: "{{ .step }}"
+
+process:
+  - fn: anomaly
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      min_points: 10
+      max_anomalies: 5
+
+response:
+  jq: |
+    {
+      total: .total_anomalies,
+      pods_analyzed: .series_analyzed,
+      pods_skipped: .series_skipped,
+      pods: [ .series[] | select(.skipped | not) | select(.anomaly_count > 0)
+              | {pod: .metric.pod, count: .anomaly_count, expected: .stats.median,
+                 anomalies: [.anomalies[] | {time, value, direction, score}]} ]
+            | sort_by(-.count)
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No CPU anomalies in namespace {{ param "namespace" }} over the last {{ param "range" }} ({{ .pods_analyzed }} pod(s) analyzed, {{ .pods_skipped }} skipped for lack of samples).{{ else }}
+    {{ .total }} anomalous CPU sample(s) in namespace {{ param "namespace" }} over the last {{ param "range" }} (IQR fences, k={{ param "sensitivity" }}; {{ .pods_analyzed }} pod(s) analyzed, {{ .pods_skipped }} skipped):
+    {{ range .pods }}{{ .pod }}: {{ .count }} anomaly(ies), expected ~{{ printf "%.3f" (float64 .expected) }} cores
+    {{ range .anomalies }}  - {{ .time }} {{ .direction }} to {{ printf "%.3f" (float64 .value) }} cores (score {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}{{ end }}

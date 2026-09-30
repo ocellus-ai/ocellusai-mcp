@@ -1,0 +1,84 @@
+# join + ssa_mv example — two range queries joined per VM into one
+# (cpu, mem) series, multivariate SSA of both together (the dims are brought
+# to one scale, the common cycles found once), a joint forecast and a
+# level-2 response.
+name: vm_cpu_mem_mssa
+description: |
+  Decomposes CPU and memory of each VM (node exporter instance) over the last
+  `range` together by multivariate Singular Spectrum Analysis: the trend and
+  the cycles the two metrics share, and those only one of them has, with the
+  share of each metric's movement every component carries. Forecasts both
+  metrics `horizon` ahead from their common structure. Returns per VM the
+  structure with per-metric shares, how much of each metric the structure
+  explains, warnings, and the forecast of each metric at its end and peak.
+  Set `window` to a multiple of the main period (1d for a daily cycle) and
+  query at least three periods of history.
+params:
+  instance: {type: string, default: ".*", description: "Regex over the instance label, e.g. vm-1.*:9100"}
+  range:    {type: string, default: "7d", pattern: "^[0-9]+[smhdwy]$", description: "Look-back range, at least three periods of the main cycle"}
+  step:     {type: string, default: "5m", pattern: "^[0-9]+[smhdwy]$", description: "Sample resolution such as 1m, 5m"}
+  window:   {type: string, default: "1d", pattern: "^[0-9]+[smhdwy]$", description: "SSA window, a multiple of the main period"}
+  horizon:  {type: string, default: "1d", pattern: "^[0-9]+[smhdwy]$", description: "How far ahead to forecast"}
+  top:      {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many VMs to list"}
+
+calls:
+  - name: cpu
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", instance=~{{ promLabel .instance }}}[5m])))
+      start: "now-{{ promDuration .range }}"
+      end: now
+      step: "{{ .step }}"
+  - name: mem
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * (1 - node_memory_MemAvailable_bytes{instance=~{{ promLabel .instance }}}
+                 / node_memory_MemTotal_bytes{instance=~{{ promLabel .instance }}})
+      start: "now-{{ promDuration .range }}"
+      end: now
+      step: "{{ .step }}"
+
+process:
+  - fn: join                         # {cpu: matrix, mem: matrix} → one (cpu, mem) series per instance
+    with:
+      inputs: [cpu, mem]
+      join_by: [instance]
+  - fn: ssa_mv
+    with:
+      window: "{{ .window }}"
+      forecast: "{{ .horizon }}"
+      clip: [0, 100]                 # both are percentages
+      min_delta: 1                   # a dim whose spread is under 1 p.p. is not blown up by normalization
+      min_points: 100
+
+response:
+  jq: |
+    {
+      analyzed: .series_analyzed,
+      skipped: [ .series[] | select(.skipped) | {instance: .labels.instance, reason} ],
+      vms: [ .series[] | select(.skipped | not)
+             | .forecast as $f
+             | {instance: .labels.instance, scale,
+                structure: [ .components[] | select(.borderline | not)
+                             | {group, meaning, cpu: .variance_share.cpu, mem: .variance_share.mem} ],
+                explained: .residual.explained,
+                warnings: [ .findings[] | select(.level == "warn") | .text ],
+                forecast: (if $f.points then
+                             {group: $f.group, end_time: $f.end_time, warning: ($f.warning // ""),
+                              cpu_end: $f.points[-1][1], mem_end: $f.points[-1][2],
+                              cpu_peak: ($f.points | map(.[1]) | max), mem_peak: ($f.points | map(.[2]) | max)}
+                           else {reason: $f.reason} end)} ]
+           | .[:$params.top]
+    }
+  render: |
+    {{ .analyzed }} VM(s) analyzed over the last {{ param "range" }} (window {{ param "window" }}, forecast {{ param "horizon" }} ahead){{ if .skipped }}; skipped: {{ range $i, $s := .skipped }}{{ if $i }}, {{ end }}{{ .instance }} ({{ .reason }}){{ end }}{{ end }}.
+    {{ range .vms }}{{ .instance }}: the structure explains {{ printf "%.0f" (mulf 100 (float64 .explained.cpu)) }}% of cpu and {{ printf "%.0f" (mulf 100 (float64 .explained.mem)) }}% of mem.
+    {{ range .structure }}  {{ .group }}: {{ .meaning }} (cpu {{ printf "%.0f" (mulf 100 (float64 .cpu)) }}%, mem {{ printf "%.0f" (mulf 100 (float64 .mem)) }}% of their variance)
+    {{ end }}{{ with .forecast }}{{ if hasKey . "reason" }}  forecast: {{ .reason }}{{ else }}  forecast of {{ .group }} to {{ .end_time }}: cpu {{ printf "%.1f" (float64 .cpu_end) }}% (peak {{ printf "%.1f" (float64 .cpu_peak) }}%), mem {{ printf "%.1f" (float64 .mem_end) }}% (peak {{ printf "%.1f" (float64 .mem_peak) }}%){{ if .warning }}
+      warning: {{ .warning }}{{ end }}{{ end }}{{ end }}
+    {{ range .warnings }}  warning: {{ . }}
+    {{ end }}{{ end }}

@@ -1,0 +1,69 @@
+# join + anomaly_mv example — two range queries, joined per VM into one
+# multivariate series by the join transform, the Mahalanobis distance over the
+# (cpu, mem) pairs and a level-2 response over the report.
+name: vm_multivariate_anomalies
+description: |
+  Finds joint CPU+memory anomalies per VM (node exporter instance) over the
+  last `range`: samples whose (cpu, memory) pair is unusual for that VM's own
+  history even when each metric alone stays within its normal range, for
+  example memory growing while CPU stays flat. Returns, per VM with
+  anomalies, the number of anomalous samples and the strongest ones with
+  time, both values, the expected values, which metric deviates most and a
+  score (Mahalanobis distance in standard deviations). Raise `threshold` to
+  keep only extreme cases.
+params:
+  instance:  {type: string, default: ".*", description: "Regex over the instance label, e.g. vm-1.*:9100"}
+  range:     {type: string, default: "2h", pattern: "^[0-9]+[smhdwy]$", description: "Look-back range such as 1h, 6h"}
+  step:      {type: string, default: "60s", pattern: "^[0-9]+[smhdwy]$", description: "Sample resolution such as 30s, 5m"}
+  threshold: {type: number, default: 3, minimum: 0.5, maximum: 20, description: "Mahalanobis distance above which a sample is anomalous"}
+
+calls:
+  - name: cpu
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", instance=~{{ promLabel .instance }}}[5m]))
+      start: "now-{{ promDuration .range }}"
+      end: now
+      step: "{{ .step }}"
+  - name: mem
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        1 - node_memory_MemAvailable_bytes{instance=~{{ promLabel .instance }}}
+          / node_memory_MemTotal_bytes{instance=~{{ promLabel .instance }}}
+      start: "now-{{ promDuration .range }}"
+      end: now
+      step: "{{ .step }}"
+
+process:
+  - fn: join                         # {cpu: matrix, mem: matrix} → one (cpu, mem) series per instance
+    with:
+      inputs: [cpu, mem]             # dimensions, in this order
+      join_by: [instance]            # one joined series per instance
+  - fn: anomaly_mv
+    with:
+      method: mahalanobis
+      threshold: "{{ .threshold }}"
+      min_points: 20
+      max_anomalies: 5
+
+response:
+  jq: |
+    {
+      total: .total_anomalies,
+      vms_analyzed: .series_analyzed,
+      vms_skipped: .series_skipped,
+      vms: [ .series[] | select(.skipped | not) | select(.anomaly_count > 0)
+             | {instance: .labels.instance, count: .anomaly_count,
+                anomalies: [.anomalies[] | {time, values, expected, dominant, score}]} ]
+           | sort_by(-.count)
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No joint CPU/memory anomalies for instance {{ param "instance" }} over the last {{ param "range" }} ({{ .vms_analyzed }} VM(s) analyzed, {{ .vms_skipped }} skipped).{{ else }}
+    {{ .total }} anomalous sample(s) over the last {{ param "range" }} (Mahalanobis distance > {{ param "threshold" }}; {{ .vms_analyzed }} VM(s) analyzed, {{ .vms_skipped }} skipped):
+    {{ range .vms }}{{ .instance }}: {{ .count }} anomaly(ies)
+    {{ range .anomalies }}  - {{ .time }} cpu={{ printf "%.2f" (float64 .values.cpu) }} (expected {{ printf "%.2f" (float64 .expected.cpu) }}) mem={{ printf "%.2f" (float64 .values.mem) }} (expected {{ printf "%.2f" (float64 .expected.mem) }}), driven by {{ .dominant }}, score {{ printf "%.1f" (float64 .score) }}
+    {{ end }}{{ end }}{{ end }}

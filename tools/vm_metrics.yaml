@@ -1,0 +1,130 @@
+name: vm_metrics
+description: |
+  Snapshot of the main node_exporter metrics of a virtual machine found by
+  name. `name` is matched case-insensitively against the hostname
+  (node_uname_info nodename) and against the host part of `instance`, with or
+  without the domain, so "db-02", "db-02.example.com" and "10.0.0.5" all work.
+  Several VMs can match (e.g. clones sharing a hostname): each is reported
+  separately. Returns [] if no VM matched within the last hour.
+  Per VM: up/down and uptime; CPU (cores, used/iowait/steal %, load 1/5/15);
+  memory (total, available, used %, swap used %, OOM kills in the last 24h);
+  filesystems (size, free, used %, inodes used %, read-only flag; tmpfs and
+  overlay excluded, bind mounts of one device folded into `mountpoints`); disks (read/write bytes/s and IOPS, utilisation %,
+  average I/O latency ms); network interfaces (rx/tx bytes/s, errors/s,
+  drops/s; lo, veth, docker and bridge interfaces excluded) and TCP
+  (established connections, retransmits/s).
+  Rates are averaged over `window`; memory, filesystems and load are current.
+  Metrics that the VM does not export are null.
+worker: prometheus
+params:
+  name: {type: string, required: true, description: "VM hostname or instance host, e.g. db-02, db-02.example.com or 10.0.0.5", pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$"}
+  window: {type: string, default: "5m", description: "Averaging window for rates such as 5m or 1h", pattern: "^[0-9]+[smhdwy]$"}
+request:
+  type: instant
+  query: |
+    {{- $re := promLabel (printf "(?i)%s([.:].*)?" (promRegex .name)) }}
+    {{- $target := printf "(last_over_time(node_uname_info{nodename=~%s}[1d]) or last_over_time(node_uname_info{instance=~%s}[1d]))" $re $re }}
+    {{- $on := printf "on (instance) %s" $target }}
+    {{- $w := promDuration .window }}
+    {{- $fs := `fstype!~"tmpfs|devtmpfs|ramfs|overlay|squashfs|nsfs|iso9660|fuse.lxcfs", mountpoint!~"/var/lib/(docker|kubelet|containers)/.+"` }}
+    {{- $disk := `device!~"(sr|loop|ram|zram|fd)[0-9]+"` }}
+    {{- $net := `device!~"lo|veth.*|docker.*|br-.*|cali.*|cilium.*|lxc.*|flannel.*|cni.*|virbr.*|vxlan.*|gke.*"` -}}
+    label_replace(max by (instance, nodename) ({{ $target }}), "stat", "info", "", "")
+    or label_replace(up and {{ $on }}, "stat", "up", "", "")
+    or label_replace((time() - node_boot_time_seconds) and {{ $on }}, "stat", "uptime_seconds", "", "")
+
+    or label_replace(count by (instance) (node_cpu_seconds_total{mode="idle"}) and {{ $on }}, "stat", "cpu_cores", "", "")
+    or label_replace(100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[{{ $w }}]))) and {{ $on }}, "stat", "cpu_used_pct", "", "")
+    or label_replace(100 * avg by (instance) (rate(node_cpu_seconds_total{mode="iowait"}[{{ $w }}])) and {{ $on }}, "stat", "cpu_iowait_pct", "", "")
+    or label_replace(100 * avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[{{ $w }}])) and {{ $on }}, "stat", "cpu_steal_pct", "", "")
+    or label_replace(node_load1 and {{ $on }}, "stat", "load1", "", "")
+    or label_replace(node_load5 and {{ $on }}, "stat", "load5", "", "")
+    or label_replace(node_load15 and {{ $on }}, "stat", "load15", "", "")
+
+    or label_replace(node_memory_MemTotal_bytes and {{ $on }}, "stat", "mem_total_bytes", "", "")
+    or label_replace(node_memory_MemAvailable_bytes and {{ $on }}, "stat", "mem_available_bytes", "", "")
+    or label_replace(100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) and {{ $on }}, "stat", "mem_used_pct", "", "")
+    or label_replace(node_memory_SwapTotal_bytes and {{ $on }}, "stat", "swap_total_bytes", "", "")
+    or label_replace(100 * (1 - node_memory_SwapFree_bytes / (node_memory_SwapTotal_bytes > 0)) and {{ $on }}, "stat", "swap_used_pct", "", "")
+    or label_replace(increase(node_vmstat_oom_kill[1d]) and {{ $on }}, "stat", "oom_kills_24h", "", "")
+
+    or label_replace(node_filesystem_size_bytes{ {{ $fs }} } and {{ $on }}, "stat", "fs_size_bytes", "", "")
+    or label_replace(node_filesystem_avail_bytes{ {{ $fs }} } and {{ $on }}, "stat", "fs_avail_bytes", "", "")
+    or label_replace(100 * (1 - node_filesystem_avail_bytes{ {{ $fs }} } / (node_filesystem_size_bytes{ {{ $fs }} } > 0)) and {{ $on }}, "stat", "fs_used_pct", "", "")
+    or label_replace(100 * (1 - node_filesystem_files_free{ {{ $fs }} } / (node_filesystem_files{ {{ $fs }} } > 0)) and {{ $on }}, "stat", "fs_inodes_used_pct", "", "")
+    or label_replace(node_filesystem_readonly{ {{ $fs }} } and {{ $on }}, "stat", "fs_readonly", "", "")
+
+    or label_replace(rate(node_disk_read_bytes_total{ {{ $disk }} }[{{ $w }}]) and {{ $on }}, "stat", "disk_read_bytes_ps", "", "")
+    or label_replace(rate(node_disk_written_bytes_total{ {{ $disk }} }[{{ $w }}]) and {{ $on }}, "stat", "disk_write_bytes_ps", "", "")
+    or label_replace(rate(node_disk_reads_completed_total{ {{ $disk }} }[{{ $w }}]) and {{ $on }}, "stat", "disk_read_iops", "", "")
+    or label_replace(rate(node_disk_writes_completed_total{ {{ $disk }} }[{{ $w }}]) and {{ $on }}, "stat", "disk_write_iops", "", "")
+    or label_replace(100 * rate(node_disk_io_time_seconds_total{ {{ $disk }} }[{{ $w }}]) and {{ $on }}, "stat", "disk_util_pct", "", "")
+    or label_replace(1000 * (rate(node_disk_read_time_seconds_total{ {{ $disk }} }[{{ $w }}]) + rate(node_disk_write_time_seconds_total{ {{ $disk }} }[{{ $w }}])) / ((rate(node_disk_reads_completed_total{ {{ $disk }} }[{{ $w }}]) + rate(node_disk_writes_completed_total{ {{ $disk }} }[{{ $w }}])) > 0) and {{ $on }}, "stat", "disk_await_ms", "", "")
+
+    or label_replace(rate(node_network_receive_bytes_total{ {{ $net }} }[{{ $w }}]) and {{ $on }}, "stat", "net_rx_bytes_ps", "", "")
+    or label_replace(rate(node_network_transmit_bytes_total{ {{ $net }} }[{{ $w }}]) and {{ $on }}, "stat", "net_tx_bytes_ps", "", "")
+    or label_replace((rate(node_network_receive_errs_total{ {{ $net }} }[{{ $w }}]) + rate(node_network_transmit_errs_total{ {{ $net }} }[{{ $w }}])) and {{ $on }}, "stat", "net_errors_ps", "", "")
+    or label_replace((rate(node_network_receive_drop_total{ {{ $net }} }[{{ $w }}]) + rate(node_network_transmit_drop_total{ {{ $net }} }[{{ $w }}])) and {{ $on }}, "stat", "net_drops_ps", "", "")
+    or label_replace(node_netstat_Tcp_CurrEstab and {{ $on }}, "stat", "tcp_established", "", "")
+    or label_replace(rate(node_netstat_Tcp_RetransSegs[{{ $w }}]) and {{ $on }}, "stat", "tcp_retrans_ps", "", "")
+  time: now-1d
+response:
+  jq: |
+    def num: .value[1] | tonumber? // null;
+    def val($s): map(select(.metric.stat == $s) | num) | first;
+    def rows($prefix; $labels; $fields):
+      map(select(.metric.stat | startswith($prefix)))
+      | group_by(.metric[$labels[0]])
+      | map(
+          ($labels + $fields | map({key: ., value: null}) | from_entries)
+          + (.[0].metric | with_entries(select(.key | IN($labels[]))))
+          + (map({key: (.metric.stat | ltrimstr($prefix)), value: num}) | from_entries)
+        );
+    [ .result
+      | group_by(.metric.instance)[]
+      | {
+          instance: .[0].metric.instance,
+          nodename: (map(select(.metric.stat == "info") | .metric.nodename) | first),
+          up: val("up"),
+          uptime_seconds: val("uptime_seconds"),
+          cpu: {
+            cores: val("cpu_cores"), used_pct: val("cpu_used_pct"), iowait_pct: val("cpu_iowait_pct"),
+            steal_pct: val("cpu_steal_pct"), load1: val("load1"), load5: val("load5"), load15: val("load15")
+          },
+          memory: {
+            total_bytes: val("mem_total_bytes"), available_bytes: val("mem_available_bytes"), used_pct: val("mem_used_pct"),
+            swap_total_bytes: val("swap_total_bytes"), swap_used_pct: val("swap_used_pct"),
+            oom_kills_24h: (val("oom_kills_24h") | if . == null then . else round end)
+          },
+          filesystems: (
+            rows("fs_"; ["mountpoint", "fstype", "device"]; ["size_bytes", "avail_bytes", "used_pct", "inodes_used_pct", "readonly"])
+            | group_by(.device)
+            | map(sort_by(.mountpoint | length) | .[0] + {mountpoints: map(.mountpoint)} | del(.mountpoint))
+            | map(.readonly |= (. == 1)) | sort_by(-(.used_pct // 0))
+          ),
+          disks: rows("disk_"; ["device"]; ["read_bytes_ps", "write_bytes_ps", "read_iops", "write_iops", "util_pct", "await_ms"]),
+          network: rows("net_"; ["device"]; ["rx_bytes_ps", "tx_bytes_ps", "errors_ps", "drops_ps"]),
+          tcp: {established: val("tcp_established"), retrans_ps: val("tcp_retrans_ps")}
+        }
+    ]
+  render: |
+    {{- define "pct" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ printf "%.1f%%" (float64 .) }}{{ end }}{{ end }}
+    {{- define "num" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ printf "%.2f" (float64 .) }}{{ end }}{{ end }}
+    {{- define "int" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ printf "%.0f" (float64 .) }}{{ end }}{{ end }}
+    {{- define "ms" }}{{ if kindIs "invalid" . }}-{{ else }}{{ printf "%.1f ms" (float64 .) }}{{ end }}{{ end }}
+    {{- define "bytes" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ $v := float64 . }}{{ if ge $v 1099511627776.0 }}{{ printf "%.1f TiB" (divf $v 1099511627776.0) }}{{ else if ge $v 1073741824.0 }}{{ printf "%.1f GiB" (divf $v 1073741824.0) }}{{ else if ge $v 1048576.0 }}{{ printf "%.1f MiB" (divf $v 1048576.0) }}{{ else if ge $v 1024.0 }}{{ printf "%.1f KiB" (divf $v 1024.0) }}{{ else }}{{ printf "%.0f B" $v }}{{ end }}{{ end }}{{ end }}
+    {{- if not . }}No VM matching "{{ param "name" }}" (by hostname or instance) reported node_exporter data in the last hour.{{ else }}{{ range . }}
+    VM {{ .nodename | default "?" }} ({{ .instance }}): {{ if kindIs "invalid" .up }}status unknown{{ else if eq (int .up) 1 }}up{{ else }}DOWN (values below are missing or stale){{ end }}{{ with .uptime_seconds }}, uptime {{ div (int64 .) 86400 }}d {{ div (mod (int64 .) 86400) 3600 }}h{{ end }}
+    CPU: {{ template "int" .cpu.cores }} cores, used {{ template "pct" .cpu.used_pct }}, iowait {{ template "pct" .cpu.iowait_pct }}, steal {{ template "pct" .cpu.steal_pct }}, load {{ template "num" .cpu.load1 }} / {{ template "num" .cpu.load5 }} / {{ template "num" .cpu.load15 }}
+    Memory: used {{ template "pct" .memory.used_pct }} of {{ template "bytes" .memory.total_bytes }} ({{ template "bytes" .memory.available_bytes }} available), swap {{ if .memory.swap_total_bytes }}{{ template "pct" .memory.swap_used_pct }} of {{ template "bytes" .memory.swap_total_bytes }}{{ else }}none{{ end }}, OOM kills in 24h: {{ template "int" .memory.oom_kills_24h }}
+    Filesystems:
+    {{ range .filesystems }}  {{ index .mountpoints 0 }}{{ if gt (len .mountpoints) 1 }} (+{{ sub (len .mountpoints) 1 }} more){{ end }} ({{ .fstype }}, {{ .device }}): used {{ template "pct" .used_pct }}, free {{ template "bytes" .avail_bytes }} of {{ template "bytes" .size_bytes }}, inodes {{ template "pct" .inodes_used_pct }}{{ if .readonly }}, READ-ONLY{{ end }}
+    {{ else }}  none reported
+    {{ end }}Disks (avg over {{ param "window" }}):
+    {{ range .disks }}  {{ .device }}: read {{ template "bytes" .read_bytes_ps }}/s ({{ template "num" .read_iops }} IOPS), write {{ template "bytes" .write_bytes_ps }}/s ({{ template "num" .write_iops }} IOPS), util {{ template "pct" .util_pct }}, await {{ template "ms" .await_ms }}
+    {{ else }}  none reported
+    {{ end }}Network (avg over {{ param "window" }}):
+    {{ range .network }}  {{ .device }}: rx {{ template "bytes" .rx_bytes_ps }}/s, tx {{ template "bytes" .tx_bytes_ps }}/s, errors {{ template "num" .errors_ps }}/s, drops {{ template "num" .drops_ps }}/s
+    {{ else }}  none reported
+    {{ end }}TCP: {{ template "int" .tcp.established }} established, {{ template "num" .tcp.retrans_ps }} retransmits/s
+    {{ end }}{{ end }}

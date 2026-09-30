@@ -1,0 +1,11 @@
+# Level 0: no response section. The worker JSON is passed through as is
+# (pretty-printed text + structuredContent).
+name: targets_up
+description: |
+  Raw `up` metric for all scrape targets, in Prometheus HTTP API format
+  ({"resultType":"vector","result":[{"metric":{...},"value":[ts,"1"]}]}).
+  Value "1" means the target is reachable, "0" means the scrape failed.
+worker: prometheus
+request:
+  type: instant
+  query: up

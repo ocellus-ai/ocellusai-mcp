@@ -1,0 +1,71 @@
+# Transaction rate per PostgreSQL database (postgres_exporter) as a range
+# query, z-score anomaly detection over every database's own history. The
+# noise filter is the processor's min_delta (tx/s away from the mean): a
+# steady database with a tiny stddev would otherwise report a blip as a
+# strong z-score, and a quiet database that bursts is still reported.
+# Assumes postgres_exporter scraped as job="postgres-exporter".
+name: pg_xact_anomalies
+description: |
+  Transaction-rate anomalies per PostgreSQL database over the `range` ending
+  at `at`: commits per second (rate of pg_stat_database_xact_commit over 5m)
+  for every database on the matching servers, each sample scored as a
+  z-score against that database's own mean and standard deviation in the
+  window, and kept only if it is at least `min_delta` tx/s away from that
+  mean. Returns how many databases were analysed and, for those with
+  anomalies, the server, database, mean and stddev of the rate and the
+  strongest anomalies with time, value, direction and score. A nearly
+  constant database (tiny stddev) no longer turns a blip into a strong
+  z-score, and a quiet one that bursts is still reported.
+worker: prometheus
+
+params:
+  instance:  {type: string, default: ".*", description: "Regex over the postgres_exporter instance label, e.g. pg-prod-.* or pg-01.*"}
+  datname:   {type: string, default: ".*", description: "Regex over the database name"}
+  at:        {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:     {type: string, default: "6h", description: "Look-back range ending at `at`", pattern: "^[0-9]+[smhdwy]$"}
+  step:      {type: string, default: "60s", description: "Sample resolution", pattern: "^[0-9]+[smhdwy]$"}
+  threshold: {type: number, default: 3, minimum: 0.5, maximum: 10, description: "z-score threshold in standard deviations"}
+  direction: {type: string, default: "both", enum: [both, up, down]}
+  top:       {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many databases to list"}
+  min_delta: {type: number, default: 1, minimum: 0, maximum: 1000000, description: "Smallest change worth reporting: tx/s away from the database's mean rate (a nearly constant database makes any blip a strong z-score)"}
+
+request:
+  type: range
+  query: |
+    sum by (instance, datname) (
+      rate(pg_stat_database_xact_commit{job="postgres-exporter", instance=~{{ promLabel .instance }}, datname=~{{ promLabel .datname }}}[5m])
+    )
+  start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+  end: "{{ .at }}"
+  step: "{{ .step }}"
+
+process:
+  - fn: anomaly
+    with:
+      method: zscore
+      threshold: "{{ .threshold }}"
+      direction: "{{ .direction }}"
+      min_points: 30
+      min_delta: "{{ .min_delta }}"  # tx/s from the mean; applied before the cap
+      max_anomalies: 3
+
+response:
+  jq: |
+    [ .series[] | select(.skipped | not) | select(.anomaly_count > 0)
+        | {instance: .metric.instance, datname: .metric.datname, points, count: .anomaly_count,
+           mean: .stats.mean, stddev: .stats.stddev, max: .stats.max,
+           anomalies: [.anomalies[] | {time, value, direction, score}]} ] as $dbs
+    | {
+      at: $params.at, range: $params.range,
+      dbs_total: .series_total, dbs_analyzed: .series_analyzed, dbs_skipped: .series_skipped,
+      raw_total: (.total_anomalies + ([.series[].below_min_delta // 0] | add // 0)),
+      total: .total_anomalies,
+      dbs_with_anomalies: ($dbs | length),
+      dbs: ($dbs | sort_by(-.count, -.max) | .[:$params.top])
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No transaction-rate anomalies of {{ param "min_delta" }}+ tx/s in the {{ .dbs_analyzed }} database(s) on {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }} (z > {{ param "threshold" }}; {{ .raw_total }} raw sample(s) were closer to the mean).{{ else }}
+    {{ .total }} anomalous sample(s) of {{ param "min_delta" }}+ tx/s in {{ .dbs_with_anomalies }} of {{ .dbs_analyzed }} database(s) on {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }} (z-score > {{ param "threshold" }}, direction {{ param "direction" }}; {{ .raw_total }} raw). Top {{ len .dbs }}:
+    {{ range .dbs }}{{ .datname }} @ {{ .instance }}: {{ .count }} anomaly(ies), mean {{ printf "%.2f" (float64 .mean) }} tx/s, stddev {{ printf "%.2f" (float64 .stddev) }}
+    {{ range .anomalies }}  - {{ .time }} {{ .direction }} to {{ printf "%.2f" (float64 .value) }} tx/s (z = {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}{{ end }}

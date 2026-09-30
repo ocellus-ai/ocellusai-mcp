@@ -1,0 +1,105 @@
+# The same two range calls as node_cpu_mem_mv (CPU busy %, memory used %)
+# joined per VM, analysed by the anomaly_ensemble processor: Matrix Profile,
+# AR residual, trailing-median level shift, Isolation Forest, PCA and k-dim
+# Matrix Profile with POT thresholds, segments instead of single samples, and
+# attribution of every segment to the metrics that caused it.
+# Assumes node_exporter scraped as job="node_exporters"; adjust the selectors
+# to your setup.
+name: node_cpu_mem_ensemble
+description: |
+  Anomalous time segments in the joint CPU+memory behaviour of each virtual
+  machine (node_exporter) over the `range` ending at `at`: spikes and drops,
+  shape changes, rare states, levels reached slowly and held, and samples
+  where the usual relation between CPU and memory breaks (CPU busy %
+  includes iowait and steal; node_deep_ensemble separates them).
+  Thresholds adapt to every VM's own noise (extreme-value theory, `risk`
+  false positives per sample and detector), so quiet and busy VMs are judged
+  on their own scale; at the default `risk` the level detector flags only a
+  level held a dozen MAD or more from the usual noise (cpu 99.9% when
+  usually 8%), a milder plateau of 4 to 11 MAD needs `risk: 0.01` around a
+  known moment. Returns, per VM with
+  anomalies, the segments with start/end/peak time, a kind (single: one
+  metric is anomalous by itself; correlation: no metric is anomalous alone
+  but their relation broke; systemic: several metrics are anomalous), the
+  score (robust z) and the metrics driving each segment with their evidence
+  (own z, share of the PCA residual, share of the shape mismatch). `window`
+  is the length of a shape to compare (an hour for 1m samples); segments
+  much shorter than a quarter of it are diluted.
+params:
+  instance: {type: string, default: ".*", description: "Regex over the instance label, e.g. web-.*"}
+  at:       {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:    {type: string, default: "1d", description: "Look-back range ending at `at`, e.g. 12h, 2d", pattern: "^[0-9]+[smhdwy]$"}
+  step:     {type: string, default: "60s", description: "Sample resolution such as 30s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  window:   {type: string, default: "1h", description: "Length of a shape to compare, e.g. 30m, 2h", pattern: "^[0-9]+[smhdwy]$"}
+  risk:     {type: number, default: 0.001, minimum: 0.000001, maximum: 0.1, description: "Expected false positives per sample and detector (POT); lower is stricter, 0.0001 hides slow multi-minute saturations, 0.01 is needed for the level detector to see a moderate plateau (4-11 MAD)"}
+  min_len:  {type: string, default: "2m", pattern: "^[1-9][0-9]*[smhdwy]?$", description: "Shortest segment to report: a duration (2m, 15m) or a number of samples (2)"}
+  max_ranges: {type: integer, default: 20, minimum: 0, maximum: 1000, description: "How many strongest segments per VM to keep; 0 keeps all. The report says when the cut hid some"}
+  top:      {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many VMs to list, most anomalous first"}
+
+calls:
+  - name: cpu
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}}[5m])))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: mem
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        # max by (instance): a relabelling inside the window (a changed role label, say) leaves
+        # two series for one instance, which join rejects
+        max by (instance) (100 * (1 - node_memory_MemAvailable_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}
+                                    / node_memory_MemTotal_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+
+process:
+  - fn: join                         # {cpu: matrix, mem: matrix} → one (cpu, mem) series per instance
+    with:
+      inputs: [cpu, mem]
+      join_by: [instance]
+  - fn: anomaly_ensemble
+    with:
+      window: "{{ .window }}"
+      risk: "{{ .risk }}"
+      min_len: "{{ .min_len }}"      # a duration or a number of samples, resolved by the step
+      min_points: 120                # at least two hours of 1m samples
+      max_ranges: "{{ .max_ranges }}"
+      top_metrics: 2
+      min_delta: {cpu: 5, mem: 3}    # points: a quarter of it is the noise floor the detectors assume,
+      min_rel_delta: 0.2             # or a fifth of the usual level if larger (as in node_deep_ensemble)
+
+response:
+  jq: |
+    [ .series[] | select(.skipped | not) | select(.anomaly_count > 0)
+      | {instance: .labels.instance, points, gaps, count: .anomaly_count, shown: (.anomalies | length), max_score,
+         anomalies: (.anomalies | map({start_time, end_time, peak_time, points, kind, score,
+                                       top: [.top_metrics[] | {metric, score, own_z, pca_share, mp_share}]}))}
+    ] as $vms
+    | {
+      at: $params.at, range: $params.range,
+      window: (.series | map(select(.skipped | not)) | .[0].window // null),
+      min_len: (.series | map(select(.skipped | not)) | .[0].min_len // null),
+      vms_total: .series_total, vms_analyzed: .series_analyzed, vms_skipped: .series_skipped,
+      total: .total_anomalies,
+      vms_with_anomalies: ($vms | length),
+      errors: [ .series[] | select(.skipped | not) | select(.error) | {instance: .labels.instance, error} ],
+      skipped: [ .series[] | select(.skipped) | {instance: .labels.instance, reason} ],
+      vms: ($vms | sort_by(-.count, -.max_score) | .[:$params.top])
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No anomalous CPU/memory segments among {{ .vms_analyzed }} VM(s) matching {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }} (window {{ param "window" }}, risk {{ param "risk" }}; {{ .vms_skipped }} skipped).{{ else }}
+    {{ .total }} anomalous segment(s) on {{ .vms_with_anomalies }} of {{ .vms_analyzed }} VM(s) over the {{ param "range" }} ending at {{ .at }} (window {{ param "window" }} = {{ .window }} samples, risk {{ param "risk" }}, segments of at least {{ param "min_len" }} = {{ .min_len }} sample(s), max_ranges {{ param "max_ranges" }}; {{ .vms_skipped }} skipped). Top {{ len .vms }}:
+    {{ range .vms }}{{ .instance }}: {{ .count }} segment(s){{ if lt (int .shown) (int .count) }} ({{ .shown }} shown, raise max_ranges to see the rest){{ end }}, max score {{ printf "%.1f" (float64 .max_score) }}{{ if gt (int .gaps) 0 }}, {{ .gaps }} gap(s){{ end }}
+    {{ range .anomalies }}  - {{ .start_time }} .. {{ .end_time }} ({{ .points }} samples, {{ .kind }}, score {{ printf "%.1f" (float64 .score) }}): {{ range $i, $m := .top }}{{ if $i }}, {{ end }}{{ $m.metric }} (own z {{ printf "%.1f" (float64 $m.own_z) }}, PCA share {{ printf "%.2f" (float64 $m.pca_share) }}, shape share {{ printf "%.2f" (float64 $m.mp_share) }}){{ end }}
+    {{ end }}{{ end }}{{ end }}
+    {{- if .errors }}
+    Multivariate ensemble failed on: {{ range $i, $e := .errors }}{{ if $i }}, {{ end }}{{ $e.instance }} ({{ $e.error }}){{ end }}{{ end }}
+    {{- if .skipped }}
+    Skipped VM(s): {{ range $i, $s := .skipped }}{{ if $i }}, {{ end }}{{ $s.instance }} ({{ $s.reason }}){{ end }}{{ end }}

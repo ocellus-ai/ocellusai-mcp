@@ -1,0 +1,75 @@
+# The raw samples of one node_exporter signal around a moment, so that an
+# agent can look at a segment reported by node_deep_ensemble or
+# node_cluster_events without leaving the tool set. One range call; the query
+# is chosen by `signal` in the template and is the same expression the
+# ensemble tools use for that signal.
+# Assumes node_exporter scraped as job="node_exporters"; adjust the selectors
+# to your setup.
+name: node_signal_window
+description: |
+  Raw samples of one node_exporter signal (cpu busy %, iowait %, cpu steal %
+  taken by the hypervisor, memory used %, busiest disk utilisation % clamped
+  to 100, network receive or transmit Mbit/s, load1 per core, established
+  TCP connections, major page faults per second) on the VMs matching
+  `instance`, in the window `around` ± `span` at
+  `step` resolution: a compact time/value table per VM with its min, median
+  and max. Use it to look at a segment reported by node_deep_ensemble
+  or node_cluster_events before drawing conclusions: a real
+  saturation, a scrape hole and a restart look different up close.
+params:
+  signal:        {type: string, required: true, enum: [cpu, iowait, steal, mem, disk, net_rx, net_tx, load, tcp, majfault], description: "Which signal to show, one of the ten used by node_deep_ensemble"}
+  instance:      {type: string, required: true, description: "Regex over the instance label, e.g. db-11.* (every match gets its own table, up to max_instances)"}
+  around:        {type: string, default: "now", description: "Centre of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  span:          {type: string, default: "30m", description: "Half-width of the window: samples from around - span to around + span, e.g. 15m, 2h", pattern: "^[1-9][0-9]*[smh]$"}
+  step:          {type: string, default: "60s", description: "Sample resolution such as 30s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  max_instances: {type: integer, default: 5, minimum: 1, maximum: 50, description: "How many matching VMs to show"}
+
+worker: prometheus
+request:
+  type: range
+  query: |
+    {{- if eq .signal "cpu" }}
+    100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}}[5m])))
+    {{- else if eq .signal "iowait" }}
+    100 * avg by (instance) (rate(node_cpu_seconds_total{mode="iowait", job="node_exporters", instance=~{{ promLabel .instance }}}[5m]))
+    {{- else if eq .signal "steal" }}
+    100 * avg by (instance) (rate(node_cpu_seconds_total{mode="steal", job="node_exporters", instance=~{{ promLabel .instance }}}[5m]))
+    {{- else if eq .signal "mem" }}
+    max by (instance) (100 * (1 - node_memory_MemAvailable_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}
+                                / node_memory_MemTotal_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}))
+    {{- else if eq .signal "disk" }}
+    clamp_max(100 * max by (instance) (rate(node_disk_io_time_seconds_total{job="node_exporters", instance=~{{ promLabel .instance }}, device=~"(sd|vd|xvd|nvme|dm-|md).*"}[5m])), 100)
+    {{- else if eq .signal "net_rx" }}
+    8 * sum by (instance) (rate(node_network_receive_bytes_total{job="node_exporters", instance=~{{ promLabel .instance }}, device!~"lo|veth.*|docker.*|br.*|virbr.*|cali.*|flannel.*|cilium.*|lxc.*"}[5m])) / 1e6
+    {{- else if eq .signal "net_tx" }}
+    8 * sum by (instance) (rate(node_network_transmit_bytes_total{job="node_exporters", instance=~{{ promLabel .instance }}, device!~"lo|veth.*|docker.*|br.*|virbr.*|cali.*|flannel.*|cilium.*|lxc.*"}[5m])) / 1e6
+    {{- else if eq .signal "load" }}
+    max by (instance) (node_load1{job="node_exporters", instance=~{{ promLabel .instance }}})
+      / count by (instance) (node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}})
+    {{- else if eq .signal "tcp" }}
+    max by (instance) (node_netstat_Tcp_CurrEstab{job="node_exporters", instance=~{{ promLabel .instance }}})
+    {{- else }}
+    max by (instance) (rate(node_vmstat_pgmajfault{job="node_exporters", instance=~{{ promLabel .instance }}}[5m]))
+    {{- end }}
+  # around - span and around + span; for now-<d> with d <= span the end clamps to now
+  start: '{{ if eq .around "now" }}now-{{ promDuration .span }}{{ else if hasPrefix "now-" .around }}now-{{ add (promDurationSeconds (trimPrefix "now-" .around)) (promDurationSeconds .span) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .around | dateModify (printf "-%ds" (promDurationSeconds .span))).Unix }}{{ end }}'
+  end: '{{ if eq .around "now" }}now{{ else if hasPrefix "now-" .around }}{{ $d := promDurationSeconds (trimPrefix "now-" .around) }}{{ $s := promDurationSeconds .span }}{{ if le $d $s }}now{{ else }}now-{{ sub $d $s }}s{{ end }}{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .around | dateModify (printf "+%ds" (promDurationSeconds .span))).Unix }}{{ end }}'
+  step: "{{ .step }}"
+
+response:
+  jq: |
+    def median: sort | if length == 0 then null elif length % 2 == 1 then .[(length / 2 | floor)] else (.[length / 2 - 1] + .[length / 2]) / 2 end;
+    [ .result[]
+      | {instance: .metric.instance,
+         samples: [ .values[] | {time: (.[0] | todate), value: (.[1] | tonumber)} ]}
+      | ([ .samples[].value ]) as $v
+      | .count = ($v | length) | .min = ($v | min) | .max = ($v | max) | .median = ($v | median)
+    ] | sort_by(.instance) | .[:$params.max_instances]
+    | {signal: $params.signal, around: $params.around, span: $params.span, step: $params.step, instances: .}
+  render: |
+    {{- $units := dict "cpu" "%" "iowait" "%" "steal" "%" "mem" "%" "disk" "%" "net_rx" " Mbit/s" "net_tx" " Mbit/s" "load" "/core" "tcp" " conn" "majfault" "/s" -}}
+    {{- $u := index $units .signal -}}
+    {{ if not .instances }}No samples of {{ .signal }} for {{ param "instance" }} around {{ .around }} ± {{ .span }}.{{ else }}
+    {{ range .instances }}{{ .instance }}: {{ $.signal }} around {{ $.around }} ± {{ $.span }}, {{ .count }} samples at {{ $.step }} (UTC): min {{ printf "%.2f" (float64 .min) }}{{ $u }}, median {{ printf "%.2f" (float64 .median) }}{{ $u }}, max {{ printf "%.2f" (float64 .max) }}{{ $u }}
+    {{ range .samples }}  {{ substr 5 16 (replace "T" " " .time) }}  {{ printf "%.2f" (float64 .value) }}
+    {{ end }}{{ end }}{{ end }}

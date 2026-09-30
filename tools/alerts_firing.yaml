@@ -1,0 +1,28 @@
+name: alerts_firing
+description: |
+  Alerts currently firing in Prometheus, optionally filtered by severity label
+  (e.g. critical, warning). Returns a short text list; structured data is
+  attached as [{"alert","severity","namespace","pod"}].
+worker: prometheus
+
+params:
+  severity: {type: string, default: "", description: "Exact severity label; empty = all"}
+
+request:
+  type: instant
+  query: |
+    ALERTS{alertstate="firing"{{ if .severity }}, severity={{ promLabel .severity }}{{ end }}}
+
+response:
+  jq: |
+    [.result[] | {
+      alert: .metric.alertname,
+      severity: (.metric.severity // "none"),
+      namespace: (.metric.namespace // ""),
+      pod: (.metric.pod // "")
+    }] | sort_by(.severity, .alert)
+  render: |
+    {{ if not . }}No firing alerts{{ if param "severity" }} with severity {{ param "severity" }}{{ end }}.{{ else }}
+    {{ len . }} firing alert(s):
+    {{ range . }}- [{{ .severity }}] {{ .alert }}{{ if .namespace }} ns={{ .namespace }}{{ end }}{{ if .pod }} pod={{ .pod }}{{ end }}
+    {{ end }}{{ end }}

@@ -1,0 +1,68 @@
+# One instant query that combines eight unrelated signals (targets down,
+# failed probes, firing alerts, full filesystems, restarting pods, high load,
+# fleet sizes) with the label_replace `stat` idiom, plus topk/threshold
+# filters rendered from parameters; jq splits the vector into sections.
+# Assumes node_exporter as job="node_exporters", blackbox probes as
+# job="blackbox" and kube-state-metrics with a `cluster` label; adjust the
+# selectors to your setup.
+name: estate_overview
+description: |
+  One-shot health overview of the whole monitored estate at time `at`:
+  scrape targets down per job, failed blackbox probes, firing alerts by name
+  and severity, filesystems above `fs_threshold` percent used (top N),
+  pods with the most container restarts over `restart_range` (top N) and
+  VMs whose 5-minute load per core exceeds 1 (top N), with the total number
+  of VMs and pods for scale. Use it as the first call when asked "is
+  anything wrong right now / at that time", then drill down with the
+  specific tools.
+worker: prometheus
+
+params:
+  at:            {type: string, default: "now", description: "Evaluation time: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  fs_threshold:  {type: number, default: 80, minimum: 1, maximum: 100, description: "Filesystem used % above which it is listed"}
+  restart_range: {type: string, default: "1d", description: "Window for counting pod restarts", pattern: "^[0-9]+[smhdwy]$"}
+  top:           {type: integer, default: 10, minimum: 1, maximum: 50, description: "Entries per section"}
+
+request:
+  type: instant
+  query: |
+    {{- $fs := `job="node_exporters", fstype!~"tmpfs|devtmpfs|ramfs|overlay|squashfs|nsfs|iso9660|fuse.*|cifs|nfs.*", mountpoint!~"/run.*|/boot.*"` }}
+    label_replace(count by (job) (up == 0), "stat", "targets_down", "", "")
+    or label_replace(probe_success{job="blackbox"} == 0, "stat", "probe_failed", "", "")
+    or label_replace(count by (alertname, severity) (ALERTS{alertstate="firing"}), "stat", "alert", "", "")
+    or label_replace(topk({{ .top }}, max by (instance, mountpoint) (100 * (1 - node_filesystem_avail_bytes{ {{ $fs }} } / (node_filesystem_size_bytes{ {{ $fs }} } > 0))) > {{ .fs_threshold }}), "stat", "fs_full", "", "")
+    or label_replace(topk({{ .top }}, sum by (cluster, namespace, pod) (increase(kube_pod_container_status_restarts_total[{{ promDuration .restart_range }}])) > 0), "stat", "pod_restarts", "", "")
+    or label_replace(topk({{ .top }}, (max by (instance) (node_load5{job="node_exporters"}) / count by (instance) (node_cpu_seconds_total{mode="idle", job="node_exporters"})) > 1), "stat", "load_high", "", "")
+    or label_replace(count(up{job="node_exporters"}), "stat", "vms_total", "", "")
+    or label_replace(count(count by (cluster, namespace, pod) (kube_pod_container_status_restarts_total)), "stat", "pods_total", "", "")
+  time: "{{ .at }}"
+
+response:
+  jq: |
+    def num: .value[1] | tonumber;
+    def rows($s): [.result[] | select(.metric.stat == $s)];
+    {
+      at: $params.at,
+      vms_total: (rows("vms_total") | map(num) | first // 0),
+      pods_total: (rows("pods_total") | map(num) | first // 0),
+      targets_down: (rows("targets_down") | map({job: .metric.job, count: num}) | sort_by(-.count)),
+      probes_failed: (rows("probe_failed") | map({service: .metric.service, instance: .metric.instance}) | sort_by(.service)),
+      alerts: (rows("alert") | map({alertname: .metric.alertname, severity: .metric.severity, count: num}) | sort_by(-.count)),
+      fs_full: (rows("fs_full") | map({instance: .metric.instance, mountpoint: .metric.mountpoint, used_pct: num}) | sort_by(-.used_pct)),
+      pod_restarts: (rows("pod_restarts") | map({cluster: .metric.cluster, namespace: .metric.namespace, pod: .metric.pod, restarts: num}) | sort_by(-.restarts)),
+      load_high: (rows("load_high") | map({instance: .metric.instance, load5_per_core: num}) | sort_by(-.load5_per_core))
+    }
+  render: |
+    Estate overview at {{ .at }} ({{ printf "%.0f" (float64 .vms_total) }} VMs, {{ printf "%.0f" (float64 .pods_total) }} pods):
+    Scrape targets down: {{ if not .targets_down }}none{{ else }}{{ range $i, $t := .targets_down }}{{ if $i }}, {{ end }}{{ $t.job }} ({{ printf "%.0f" (float64 $t.count) }}){{ end }}{{ end }}
+    Failed probes: {{ if not .probes_failed }}none{{ else }}{{ range $i, $p := .probes_failed }}{{ if $i }}, {{ end }}{{ $p.service }}{{ end }}{{ end }}
+    Firing alerts: {{ if not .alerts }}none{{ else }}{{ range $i, $a := .alerts }}{{ if $i }}, {{ end }}{{ $a.alertname }} [{{ $a.severity }}] x{{ printf "%.0f" (float64 $a.count) }}{{ end }}{{ end }}
+    Filesystems above {{ param "fs_threshold" }}% used (top {{ param "top" }}):{{ if not .fs_full }} none{{ end }}
+    {{- range .fs_full }}
+      - {{ .instance }} {{ .mountpoint }}: {{ printf "%.1f" (float64 .used_pct) }}%{{ end }}
+    Pods restarted in the last {{ param "restart_range" }} (top {{ param "top" }}):{{ if not .pod_restarts }} none{{ end }}
+    {{- range .pod_restarts }}
+      - {{ .cluster }} / {{ .namespace }} / {{ .pod }}: {{ printf "%.0f" (float64 .restarts) }}{{ end }}
+    VMs with load5 per core > 1 (top {{ param "top" }}):{{ if not .load_high }} none{{ end }}
+    {{- range .load_high }}
+      - {{ .instance }}: {{ printf "%.2f" (float64 .load5_per_core) }}{{ end }}

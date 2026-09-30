@@ -1,0 +1,36 @@
+# REST worker, level 2: GET with query parameters, then jq + render.
+# The instance `rest` in config.yaml points at the Alertmanager API v2 base URL.
+name: alertmanager_silences
+description: |
+  Alertmanager silences with their matchers, time range and author.
+  state selects active (default), pending, expired or all silences; filter narrows
+  the list with Alertmanager matcher syntax, e.g. alertname="HighCPU".
+  Read-only. Returns [{"id","state","matchers","starts_at","ends_at","created_by","comment"}].
+worker: rest
+
+params:
+  state:  {type: string, default: active, enum: [active, pending, expired, all], description: "Silence state to list"}
+  filter: {type: string, default: "", description: "Alertmanager matcher filter, e.g. alertname=\"HighCPU\""}
+
+request:
+  method: GET
+  path: /silences
+  query:
+    filter: "{{ .filter }}"        # a value that renders empty is left out of the query string
+
+response:
+  jq: |
+    [.[] | select($params.state == "all" or .status.state == $params.state) | {
+      id,
+      state: .status.state,
+      matchers: ([.matchers[]
+        | .name
+          + (if .isEqual == false then (if .isRegex then "!~" else "!=" end) else (if .isRegex then "=~" else "=" end) end)
+          + "\"" + .value + "\""] | join(", ")),
+      starts_at: .startsAt, ends_at: .endsAt, created_by: .createdBy, comment
+    }]
+  render: |
+    {{- if not . }}No {{ param "state" }} silences.
+    {{- else }}{{ len . }} {{ param "state" }} silence(s):
+    {{ range . }}- {{ .id }} [{{ .state }}] {{ .matchers }} until {{ .ends_at }} by {{ .created_by }}: {{ .comment }}
+    {{ end }}{{ end }}

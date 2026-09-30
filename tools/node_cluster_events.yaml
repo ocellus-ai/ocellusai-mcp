@@ -1,0 +1,240 @@
+# The ten-signal ensemble of node_deep_ensemble followed by cluster_events,
+# so that synchronous segments on many VMs collapse into one line per
+# cluster: "11:05..11:13: iowait, disk, cpu on 5 VMs". Without it a dozen
+# database nodes over a few days produce hundreds of single-signal lines that
+# an agent can read and a human cannot.
+#
+# Pipeline: 10 range calls → join → anomaly_ensemble → jq (the significant
+# joint segments and the single-signal segments of every VM as one flat list
+# of events, the same minimum-change rules as node_deep_ensemble) →
+# cluster_events → jq/render. The per-VM summary of the ensemble (skipped,
+# errors, raw counts) is not repeated here: node_deep_ensemble has it.
+# Assumes node_exporter scraped as job="node_exporters"; adjust the selectors
+# to your setup.
+name: node_cluster_events
+description: |
+  Synchronous anomalies across a group of virtual machines (node_exporter)
+  over the `range` ending at `at`: the ten-signal ensemble analysis of
+  node_deep_ensemble (cpu, iowait, cpu steal, memory, disk, network
+  rx/tx, load, TCP connections, major page faults) is run for every VM matching
+  `instance`, its significant segments (joint and single-signal) become
+  events, and events that overlap in time within `gap` are grouped into
+  clusters. A cluster needs events from at least `min_series` VMs; the
+  rest are listed as single events per VM. Each cluster shows its time
+  span, which signals moved on how many VMs, the VMs involved, and the
+  `detail` strongest events with values at the peak and the usual level.
+  Use it to tell a scheduled cluster-wide job or an incident on many nodes
+  from a problem of one VM; then node_deep_ensemble for one VM and
+  node_signal_window for the raw samples. Same thresholds as
+  node_deep_ensemble (`min_effect`, `min_rel_effect`, idle VMs
+  skipped). At the default `risk` the level detector flags only levels held
+  a dozen MAD or more from the usual noise; a milder plateau of 4 to 11 MAD
+  needs `risk: 0.01` around a known moment.
+params:
+  instance:       {type: string, default: ".*", description: "Regex over the instance label selecting the group of VMs, e.g. db-.* or kafka-.*"}
+  at:             {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:          {type: string, default: "12h", description: "Look-back range ending at `at`, e.g. 6h, 1d, 6d with step 5m", pattern: "^[0-9]+[smhdwy]$"}
+  step:           {type: string, default: "60s", description: "Sample resolution such as 60s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  window:         {type: string, default: "1h", description: "Length of a shape to compare, e.g. 30m, 2h", pattern: "^[0-9]+[smhdwy]$"}
+  risk:           {type: number, default: 0.001, minimum: 0.000001, maximum: 0.1, description: "Expected false positives per sample and detector (POT); lower is stricter; the level detector sees a moderate plateau (4-11 MAD) only at 0.01"}
+  min_len:        {type: string, default: "2m", pattern: "^[1-9][0-9]*[smhdwy]?$", description: "Shortest segment to report: a duration (2m, 15m) or a number of samples (2)"}
+  max_ranges:     {type: integer, default: 20, minimum: 0, maximum: 1000, description: "How many strongest raw segments per VM and per signal to keep before the minimum-change filter; 0 keeps all"}
+  kmp_dims:       {type: integer, default: -1, minimum: -1, maximum: 10, description: "k-dim Matrix Profile: -1 worst signal, 0 average over all signals, k average of the k best-matching signals"}
+  detectors:      {type: string, default: "mp,ar,level,iforest,pca,kmp", pattern: "^[a-z_]+(,[a-z_]+)*$", description: "Comma-separated subset of mp (shape), ar (jumps), level (a level reached slowly and held; at the default risk only shifts of a dozen MAD or more, risk 0.01 for milder plateaus), iforest (rare states), pca (broken relations), kmp (multi-signal shape)"}
+  min_effect:     {type: number, default: 1, minimum: 0, maximum: 100, description: "Multiplier for the per-signal minimum change at the peak (cpu 5 pts, iowait 1 pt, steal 1 pt, mem 3 pts, disk 10 pts, net 5 Mbit/s, load 0.25/core, tcp 20 conn, majfault 5/s); a quarter of it is also the noise floor the detectors assume. 0 disables this threshold"}
+  min_rel_effect: {type: number, default: 0.2, minimum: 0, maximum: 10, description: "Second minimum change as a fraction of the signal's usual level; the larger threshold applies. 0 disables it"}
+  min_activity:   {type: number, default: 1, minimum: 0, maximum: 100, description: "Skip idle VMs (median cpu below 2%, network below 10 Mbit/s, scaled by this); 0 keeps every VM"}
+  gap:            {type: string, default: "5m", pattern: "^[0-9]+[smh]$", description: "Events overlapping or at most this far apart are linked into one cluster"}
+  min_series:     {type: integer, default: 2, minimum: 1, maximum: 100, description: "A cluster needs events from at least this many VMs; smaller groups are listed as single events"}
+  max_clusters:   {type: integer, default: 20, minimum: 0, maximum: 500, description: "How many clusters to show, the ones on most VMs first; 0 = all. Shown in time order"}
+  detail:         {type: integer, default: 3, minimum: 0, maximum: 50, description: "How many strongest events to detail per cluster and per VM among the single events"}
+
+calls:
+  - name: cpu
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}}[5m])))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: iowait
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * avg by (instance) (rate(node_cpu_seconds_total{mode="iowait", job="node_exporters", instance=~{{ promLabel .instance }}}[5m]))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: steal
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * avg by (instance) (rate(node_cpu_seconds_total{mode="steal", job="node_exporters", instance=~{{ promLabel .instance }}}[5m]))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: mem
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        max by (instance) (100 * (1 - node_memory_MemAvailable_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}
+                                    / node_memory_MemTotal_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: disk
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        clamp_max(100 * max by (instance) (rate(node_disk_io_time_seconds_total{job="node_exporters", instance=~{{ promLabel .instance }}, device=~"(sd|vd|xvd|nvme|dm-|md).*"}[5m])), 100)
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: net_rx
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        8 * sum by (instance) (rate(node_network_receive_bytes_total{job="node_exporters", instance=~{{ promLabel .instance }}, device!~"lo|veth.*|docker.*|br.*|virbr.*|cali.*|flannel.*|cilium.*|lxc.*"}[5m])) / 1e6
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: net_tx
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        8 * sum by (instance) (rate(node_network_transmit_bytes_total{job="node_exporters", instance=~{{ promLabel .instance }}, device!~"lo|veth.*|docker.*|br.*|virbr.*|cali.*|flannel.*|cilium.*|lxc.*"}[5m])) / 1e6
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: load
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        max by (instance) (node_load1{job="node_exporters", instance=~{{ promLabel .instance }}})
+          / count by (instance) (node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}})
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: tcp
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        max by (instance) (node_netstat_Tcp_CurrEstab{job="node_exporters", instance=~{{ promLabel .instance }}})
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: majfault
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        max by (instance) (rate(node_vmstat_pgmajfault{job="node_exporters", instance=~{{ promLabel .instance }}}[5m]))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+
+process:
+  - fn: join                         # ten matrices → one 10-dimensional series per instance
+    with:
+      inputs: [cpu, iowait, steal, mem, disk, net_rx, net_tx, load, tcp, majfault]
+      join_by: [instance]
+  - fn: anomaly_ensemble
+    with:
+      window: "{{ .window }}"
+      risk: "{{ .risk }}"
+      min_len: "{{ .min_len }}"
+      kmp_dims: "{{ .kmp_dims }}"
+      detectors: "{{ .detectors }}"
+      min_points: 120                # at least two hours of 1m samples
+      max_ranges: "{{ .max_ranges }}"
+      top_metrics: 1                 # the attribution list is not used here: values/baseline carry every signal
+      # the per-signal minimum change (the $delta table below, scaled by min_effect) or
+      # min_rel_effect of the usual level: a quarter of it is the noise floor the
+      # detectors assume, so a blip of a nearly flat signal is not a segment at all
+      min_delta:
+        cpu: "{{ mulf 5 .min_effect }}"
+        iowait: "{{ mulf 1 .min_effect }}"
+        steal: "{{ mulf 1 .min_effect }}"
+        mem: "{{ mulf 3 .min_effect }}"
+        disk: "{{ mulf 10 .min_effect }}"
+        net_rx: "{{ mulf 5 .min_effect }}"
+        net_tx: "{{ mulf 5 .min_effect }}"
+        load: "{{ mulf 0.25 .min_effect }}"
+        tcp: "{{ mulf 20 .min_effect }}"
+        majfault: "{{ mulf 5 .min_effect }}"
+      min_rel_delta: "{{ .min_rel_effect }}"
+  - fn: jq                           # the ensemble report → one flat list of significant events
+    with:
+      expr: |
+        {cpu: 5, iowait: 1, steal: 1, mem: 3, disk: 10, net_rx: 5, net_tx: 5, load: 0.25, tcp: 20, majfault: 5} as $delta
+        | def unit($k; $b): [$delta[$k] * $params.min_effect, $params.min_rel_effect * ($b | fabs)] | max;
+          def moved($k; $v; $b): $v != null and $b != null and ((($v - $b) | fabs) >= unit($k; $b));
+          def effect($k; $v; $b): if $v == null or $b == null then 0
+              else unit($k; $b) as $u | (($v - $b) | fabs) / (if $u > 0 then $u else $delta[$k] end) end;
+          def idle: $params.min_activity > 0
+              and (.baseline.cpu // 0) < 2 * $params.min_activity
+              and ((.baseline.net_rx // 0) + (.baseline.net_tx // 0)) < 10 * $params.min_activity;
+          [ .series[] | select(.skipped | not) | select(idle | not)
+            | .labels.instance as $inst | .anomalies as $mv
+            # joint segments with at least one signal that moved
+            | ( $mv[] | . as $a
+                | ([ $a.values | to_entries[] | select(moved(.key; .value; $a.baseline[.key])) | .key ]) as $sig
+                | select(($sig | length) > 0)
+                | {labels: {instance: $inst}, start, end, peak_time, points, kind, score, fired_by, signals: $sig,
+                   effect: ([ $sig[] | . as $k | effect($k; $a.values[$k]; $a.baseline[$k]) ] | max // 0),
+                   values: ([ $sig[] | {key: ., value: {value: $a.values[.], baseline: $a.baseline[.]}} ] | from_entries)} ),
+              # single-signal segments that no joint segment fully covers
+              ( .metrics | to_entries[] | .key as $dim | .value.anomalies[]
+                | select(moved($dim; .value; .baseline))
+                | . as $s | select(([ $mv[] | select(.start <= $s.start and .end >= $s.end) ] | length) == 0)
+                | {labels: {instance: $inst}, start, end, peak_time, points, kind: "signal", score, fired_by, signals: [$dim],
+                   effect: effect($dim; .value; .baseline),
+                   values: {($dim): {value, baseline}}} )
+          ]
+  - fn: cluster_events
+    with:
+      gap: "{{ .gap }}"
+      min_series: "{{ .min_series }}"
+      max_clusters: "{{ .max_clusters }}"
+
+response:
+  jq: |
+    # instance without the port and the domain (an IP stays as is)
+    def short: sub(":[0-9]+$"; "") | if test("^[0-9.]+$") then . else split(".")[0] end;
+    def brief: {instance: (.labels.instance | short), start_time, end_time, kind, effect, signals, values};
+    {
+      at: $params.at, range: $params.range,
+      events_total, series_total, clusters_total, clustered_events,
+      clusters_shown: (.clusters | length),
+      single_total: (.singles | length),
+      clusters: [ .clusters[]
+        | {start_time, end_time, minutes: (.duration / 60 | round), series_count, event_count, score,
+           max_effect: ([ .events[].effect ] | max // 0),
+           instances: [ .series[].instance | short ],
+           signals: [ .signals[] | "\(.signal)(\(.series))" ],
+           kinds: ([ .events[].kind ] | group_by(.) | map("\(.[0])=\(length)")),
+           top: ([ .events[] | brief ] | sort_by(-.effect) | .[:$params.detail])} ],
+      singles: ([ .singles[] | brief ]
+                | group_by(.instance)
+                | map({instance: .[0].instance, count: length, events: (sort_by(-.effect) | .[:$params.detail])})
+                | sort_by(-.count))
+    }
+  render: |
+    {{- $units := dict "cpu" "%" "iowait" "%" "steal" "%" "mem" "%" "disk" "%" "net_rx" " Mbit/s" "net_tx" " Mbit/s" "load" "/core" "tcp" " conn" "majfault" "/s" -}}
+    {{ if eq (int .events_total) 0 }}No significant anomalous segments on the VM(s) matching {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }} (window {{ param "window" }}, risk {{ param "risk" }}, min change x{{ param "min_effect" }} or {{ param "min_rel_effect" }} of the usual level).{{ else if eq (int .clusters_total) 0 }}{{ .events_total }} significant event(s) on {{ .series_total }} VM(s) matching {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }}, but none overlap across {{ param "min_series" }}+ VMs within {{ param "gap" }}: no clusters. Single events by VM:{{ else }}
+    {{ .clusters_total }} cluster(s){{ if lt (int .clusters_shown) (int .clusters_total) }} ({{ .clusters_shown }} shown, raise max_clusters for the rest){{ end }} covering {{ .clustered_events }} of {{ .events_total }} significant event(s) on {{ .series_total }} VM(s) matching {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }}; events link within {{ param "gap" }}, a cluster needs {{ param "min_series" }}+ VMs (window {{ param "window" }}, risk {{ param "risk" }}, min change x{{ param "min_effect" }} or {{ param "min_rel_effect" }} of the usual level). Times are UTC; a signal's count is the number of VMs it moved on.
+    {{ range .clusters }}- {{ substr 5 16 (replace "T" " " .start_time) }}..{{ substr 11 16 .end_time }} ({{ .minutes }} min): {{ join ", " .signals }} on {{ .series_count }} VM(s) ({{ join ", " .instances }}); {{ .event_count }} event(s) {{ join " " .kinds }}, max change {{ printf "%.1f" (float64 .max_effect) }}x the minimum, score {{ printf "%.3g" (float64 .score) }}
+    {{ range .top }}    {{ .instance }} {{ substr 11 16 .start_time }}..{{ substr 11 16 .end_time }} ({{ .kind }}, change {{ printf "%.1f" (float64 .effect) }}x): {{ $ev := . }}{{ range $i, $s := .signals }}{{ if $i }}, {{ end }}{{ $s }} {{ printf "%.1f" (float64 (index $ev.values $s).value) }}{{ index $units $s }} (usually {{ printf "%.1f" (float64 (index $ev.values $s).baseline) }}){{ end }}
+    {{ end }}{{ end }}{{ if .singles }}Single events outside clusters, by VM ({{ .single_total }}):{{ end }}{{ end }}
+    {{- range .singles }}
+    - {{ .instance }}: {{ .count }} event(s){{ range .events }}; {{ substr 5 16 (replace "T" " " .start_time) }}..{{ substr 11 16 .end_time }} {{ $ev := . }}{{ range $i, $s := .signals }}{{ if $i }}, {{ end }}{{ $s }} {{ printf "%.1f" (float64 (index $ev.values $s).value) }}{{ index $units $s }} (usually {{ printf "%.1f" (float64 (index $ev.values $s).baseline) }}){{ end }}{{ end }}{{ if gt (int .count) (len .events) }}; and {{ sub (int .count) (len .events) }} more{{ end }}{{ end }}

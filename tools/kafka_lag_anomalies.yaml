@@ -1,0 +1,67 @@
+# Consumer-group lag per (group, topic) as a range query, IQR anomaly
+# detection with direction=up (only lag spikes matter). The minimum spike
+# size is the processor's min_delta: it runs before max_anomalies, so the cap
+# keeps the three strongest spikes that matter. Assumes kafka_exporter
+# (kafka_consumergroup_lag).
+name: kafka_lag_anomalies
+description: |
+  Kafka consumer-lag spikes per consumer group and topic over the `range`
+  ending at `at`: lag summed over partitions, each sample compared with the
+  IQR fences of that group+topic's own history (only upward deviations are
+  reported) and kept only if it rises at least `min_lag` messages above
+  the pair's typical (median) lag. Returns how many group/topic pairs were
+  analysed and, for those with spikes, the typical lag, the upper fence and
+  the strongest spikes with time, lag and score. `group` and `topic` are regexes.
+worker: prometheus
+
+params:
+  group:       {type: string, default: ".*", description: "Regex over the consumergroup label"}
+  topic:       {type: string, default: ".*", description: "Regex over the topic label"}
+  at:          {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:       {type: string, default: "6h", description: "Look-back range ending at `at`", pattern: "^[0-9]+[smhdwy]$"}
+  step:        {type: string, default: "60s", description: "Sample resolution", pattern: "^[0-9]+[smhdwy]$"}
+  sensitivity: {type: number, default: 3, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k"}
+  top:         {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many group/topic pairs to list"}
+  min_lag:     {type: number, default: 1000, minimum: 0, maximum: 1000000000, description: "Smallest spike worth reporting: messages above the pair's typical (median) lag (a group that is normally at 0 makes any lag an outlier)"}
+
+request:
+  type: range
+  query: |
+    sum by (consumergroup, topic) (
+      kafka_consumergroup_lag{consumergroup=~{{ promLabel .group }}, topic=~{{ promLabel .topic }}}
+    )
+  start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+  end: "{{ .at }}"
+  step: "{{ .step }}"
+
+process:
+  - fn: anomaly
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      direction: up
+      min_points: 30
+      min_delta: "{{ .min_lag }}"    # messages above the median; drops the blips of pairs that sit at 0 before the cap
+      max_anomalies: 3               # the three strongest per pair, in time order
+
+response:
+  jq: |
+    [ .series[] | select(.skipped | not) | select(.anomaly_count > 0)
+      | {group: .metric.consumergroup, topic: .metric.topic, points, count: .anomaly_count,
+         median: .stats.median, upper: .stats.upper, max: .stats.max,
+         anomalies: [.anomalies[] | {time, value, score}]}
+    ] as $pairs
+    | {
+      at: $params.at, range: $params.range,
+      pairs_total: .series_total, pairs_analyzed: .series_analyzed, pairs_skipped: .series_skipped,
+      raw_total: (.total_anomalies + ([.series[].below_min_delta // 0] | add // 0)),
+      total: .total_anomalies,
+      pairs_with_spikes: ($pairs | length),
+      pairs: ($pairs | sort_by(-.count, -.max) | .[:$params.top])
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No consumer-lag spikes of {{ param "min_lag" }}+ messages above the typical lag in {{ .pairs_analyzed }} group/topic pair(s) over the {{ param "range" }} ending at {{ .at }} (IQR k={{ param "sensitivity" }}; {{ .raw_total }} smaller deviation(s) ignored).{{ else }}
+    {{ .total }} lag spike(s) of {{ param "min_lag" }}+ messages above the typical lag in {{ .pairs_with_spikes }} of {{ .pairs_analyzed }} group/topic pair(s) over the {{ param "range" }} ending at {{ .at }} (IQR k={{ param "sensitivity" }}; {{ .raw_total }} raw deviation(s), {{ .pairs_skipped }} pair(s) skipped). Top {{ len .pairs }}:
+    {{ range .pairs }}{{ .group }} / {{ .topic }}: {{ .count }} spike(s), typical lag {{ printf "%.0f" (float64 .median) }}, upper fence {{ printf "%.0f" (float64 .upper) }}, max {{ printf "%.0f" (float64 .max) }}
+    {{ range .anomalies }}  - {{ .time }} lag {{ printf "%.0f" (float64 .value) }} (score {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}{{ end }}

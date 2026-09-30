@@ -1,0 +1,128 @@
+# ocellusai-mcp in Kubernetes: Deployment + Service + ConfigMap for config.yaml.
+#
+# The tool catalog lives in a second ConfigMap built straight from the tools/
+# directory, so adding a tool is "add a YAML file, re-create the ConfigMap":
+#
+#   kubectl -n monitoring create configmap ocellusai-mcp-tools --from-file=tools/ \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n monitoring apply -f deploy/k8s.yaml
+#   kubectl -n monitoring rollout restart deploy/ocellusai-mcp   # no hot-reload in MVP
+#
+# Clients reach the MCP endpoint at http://ocellusai-mcp.monitoring.svc:8080/mcp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ocellusai-mcp-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    server:
+      transport: http
+      listen: ":8080"
+    tools_dir: /etc/ocellusai-mcp/tools
+    workers:
+      prometheus:
+        url: http://prometheus.monitoring.svc:9090
+        timeout: 15s
+      shell:
+        allowlist: [kubectl, df]
+        timeout: 30s
+        max_output_bytes: 1048576
+        env: {}
+      rest:
+        url: http://alertmanager.monitoring.svc:9093/api/v2
+        timeout: 15s
+        # methods: [GET]   # make the instance read-only if the alertmanager_silence_* actions are not wanted
+    log:
+      level: info
+      format: json
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ocellusai-mcp
+  namespace: monitoring
+---
+# Read-only access for the pods_status tool (kubectl inside the pod uses the
+# in-cluster service account). Drop this and the shell worker if unused.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ocellusai-mcp-readonly
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ocellusai-mcp-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ocellusai-mcp-readonly
+subjects:
+  - kind: ServiceAccount
+    name: ocellusai-mcp
+    namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocellusai-mcp
+  namespace: monitoring
+  labels: {app: ocellusai-mcp}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ocellusai-mcp}
+  template:
+    metadata:
+      labels: {app: ocellusai-mcp}
+    spec:
+      serviceAccountName: ocellusai-mcp
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: ocellusai-mcp
+          # Use the `with-kubectl` image target if the shell worker needs kubectl.
+          image: ocellusai-mcp:dev
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/ocellusai-mcp/config.yaml"]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/ocellusai-mcp/config.yaml, subPath: config.yaml, readOnly: true}
+            - {name: tools, mountPath: /etc/ocellusai-mcp/tools, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: ocellusai-mcp-config}
+        - name: tools
+          configMap: {name: ocellusai-mcp-tools}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ocellusai-mcp
+  namespace: monitoring
+spec:
+  selector: {app: ocellusai-mcp}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

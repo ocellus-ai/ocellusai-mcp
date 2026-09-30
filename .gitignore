@@ -1,0 +1,7 @@
+bin/
+*.test
+coverage.out
+.DS_Store
+/config.yaml
+/config.stdio.yaml
+__pycache__/

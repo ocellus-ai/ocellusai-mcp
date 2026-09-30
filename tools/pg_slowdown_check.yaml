@@ -1,0 +1,137 @@
+name: pg_slowdown_check
+description: |
+  Host (node_exporter) and database (postgres_exporter) health for one
+  PostgreSQL server, every signal shown for the last `window` and for the
+  same window `compare` ago, with the percent change. Use it for "why is
+  postgresXX slow / slower than last week", "is something stuck", "is the
+  replica healthy". Returns three groups: host, database, replication.
+  Signals absent from the output are not collected on that host; say so
+  instead of guessing. Query latency and per-table bloat are NOT here
+  (needs pg_stat_statements / per-database scraping).
+
+  How to read the signals (rough, load-dependent thresholds):
+  host — cpu_busy >80% or load1_per_core >1 = CPU-bound; iowait >10-15% or
+    disk_busy >80% or disk_await >20 ms = storage-bound; steal >5% = noisy
+    neighbour on the hypervisor; mem_avail <10% with swap_out >0 = memory
+    pressure; procs_blocked = processes waiting on I/O; fs_free_min <10% =
+    disk filling (WAL/temp/bloat) — PostgreSQL stops when the data volume is
+    full.
+  database — pool_used >80% = running out of connections; backends_idle_in_tx
+    >0 for long = transactions holding locks and blocking vacuum; max_tx_sec
+    = oldest non-idle transaction (minutes+ is suspicious, hours is a stuck
+    session); access_exclusive_locks >0 = DDL/VACUUM FULL blocking everyone;
+    cache_hit <95% = working set no longer fits shared_buffers; seqscan_rows
+    rising = planner switched to sequential scans (missing index, stale
+    stats, bloat); temp_bytes rising = sorts/hashes spilling to disk
+    (work_mem too small); rollback_pct rising = errors/deadlocks in the app;
+    deadlocks >0 = lock ordering bug; checkpoints_req >30% = checkpoints
+    forced by WAL volume (max_wal_size too small), buffers_backend >0 =
+    backends flushing dirty pages themselves; xact_per_s dropping with
+    everything else steady = the load itself changed or clients are stuck.
+  replication — replication_lag_sec is computed on the replica as
+    now() - last replayed transaction, so it also grows when the primary is
+    idle: ALWAYS check it against replica_behind_bytes from the primary
+    (0 while lag is huge = artefact; large or absent = replica really behind
+    or disconnected); conflicts >0 = queries on the replica cancelled by
+    replay; inactive_slots >0 or slot_retained_wal growing = a dead
+    subscriber is pinning WAL and will fill the disk.
+
+  Windows longer than a day: raise `step` (15m+) to keep the query cheap.
+worker: prometheus
+params:
+  host: {type: string, description: "Hostname as in the instance label, without port, e.g. pg-01.example.com", pattern: "^[a-zA-Z0-9._-]+$"}
+  window: {type: string, default: "1h", description: "Averaging window for 'now'", pattern: "^[0-9]+[smhdwy]$"}
+  compare: {type: string, default: "7d", description: "How far back to take the baseline window", pattern: "^[0-9]+[smhdwy]$"}
+  step: {type: string, default: "5m", description: "Subquery resolution", pattern: "^[0-9]+[smhdwy]$"}
+request:
+  type: instant
+  query: |
+    {{- define "tag" -}}
+    label_replace(label_replace(label_replace(label_replace({{ .e }}, "stat", "{{ .n }}", "", ""), "unit", "{{ .u }}", "", ""), "grp", "{{ .g }}", "", ""), "ord", "{{ .o }}", "", "")
+    {{- end -}}
+    {{- $n := printf `instance=~"%s(:[0-9]+)?"` .host }}
+    {{- $d := printf `instance=~"%s(:[0-9]+)?",device!~"loop.*|dm-.*|sr.*"` .host }}
+    {{- $f := printf `instance=~"%s(:[0-9]+)?",fstype!~"tmpfs|overlay|squashfs|ramfs"` .host }}
+    {{- $p := printf `instance=~"%s(:[0-9]+)?"` .host }}
+    {{- $w := promDuration .window }}{{ $s := promDuration .step }}{{ $c := promDuration .compare }}
+    {{- $trend := list
+        (dict "g" "1_host" "n" "cpu_busy_pct"            "u" "%"   "q" (printf `(1 - avg(rate(node_cpu_seconds_total{mode="idle",%s}[5m]))) * 100` $n))
+        (dict "g" "1_host" "n" "iowait_pct"              "u" "%"   "q" (printf `avg(rate(node_cpu_seconds_total{mode="iowait",%s}[5m])) * 100` $n))
+        (dict "g" "1_host" "n" "steal_pct"               "u" "%"   "q" (printf `avg(rate(node_cpu_seconds_total{mode="steal",%s}[5m])) * 100` $n))
+        (dict "g" "1_host" "n" "load1_per_core"          "u" ""    "q" (printf `sum(node_load1{%s}) / count(node_cpu_seconds_total{mode="idle",%s})` $n $n))
+        (dict "g" "1_host" "n" "procs_blocked"           "u" ""    "q" (printf `sum(node_procs_blocked{%s})` $n))
+        (dict "g" "1_host" "n" "mem_avail_pct"           "u" "%"   "q" (printf `sum(node_memory_MemAvailable_bytes{%s}) / sum(node_memory_MemTotal_bytes{%s}) * 100` $n $n))
+        (dict "g" "1_host" "n" "swap_out_per_s"          "u" "/s"  "q" (printf `sum(rate(node_vmstat_pswpout{%s}[5m]))` $n))
+        (dict "g" "1_host" "n" "disk_busy_pct"           "u" "%"   "q" (printf `max(rate(node_disk_io_time_seconds_total{%s}[5m])) * 100` $d))
+        (dict "g" "1_host" "n" "disk_await_ms"           "u" "ms"  "q" (printf `sum(rate(node_disk_read_time_seconds_total{%s}[5m]) + rate(node_disk_write_time_seconds_total{%s}[5m])) / sum(rate(node_disk_reads_completed_total{%s}[5m]) + rate(node_disk_writes_completed_total{%s}[5m])) * 1000` $d $d $d $d))
+        (dict "g" "1_host" "n" "fs_free_min_pct"         "u" "%"   "q" (printf `min(node_filesystem_avail_bytes{%s} / node_filesystem_size_bytes{%s}) * 100` $f $f))
+
+        (dict "g" "2_db"   "n" "backends_total"          "u" ""    "q" (printf `sum(pg_stat_activity_count{%s})` $p))
+        (dict "g" "2_db"   "n" "backends_active"         "u" ""    "q" (printf `sum(pg_stat_activity_count{state="active",%s})` $p))
+        (dict "g" "2_db"   "n" "backends_idle_in_tx"     "u" ""    "q" (printf `sum(pg_stat_activity_count{state="idle in transaction",%s})` $p))
+        (dict "g" "2_db"   "n" "pool_used_pct"           "u" "%"   "q" (printf `sum(pg_stat_activity_count{%s}) / max(pg_settings_max_connections{%s}) * 100` $p $p))
+        (dict "g" "2_db"   "n" "max_tx_sec"              "u" "s"   "q" (printf `max(pg_stat_activity_max_tx_duration{state!="idle",%s})` $p))
+        (dict "g" "2_db"   "n" "access_exclusive_locks"  "u" ""    "q" (printf `sum(pg_locks_count{mode="accessexclusivelock",%s})` $p))
+        (dict "g" "2_db"   "n" "xact_per_s"              "u" "/s"  "q" (printf `sum(rate(pg_stat_database_xact_commit{%s}[5m]) + rate(pg_stat_database_xact_rollback{%s}[5m]))` $p $p))
+        (dict "g" "2_db"   "n" "rollback_pct"            "u" "%"   "q" (printf `sum(rate(pg_stat_database_xact_rollback{%s}[5m])) / sum(rate(pg_stat_database_xact_commit{%s}[5m]) + rate(pg_stat_database_xact_rollback{%s}[5m])) * 100` $p $p $p))
+        (dict "g" "2_db"   "n" "cache_hit_pct"           "u" "%"   "q" (printf `sum(rate(pg_stat_database_blks_hit{%s}[5m])) / sum(rate(pg_stat_database_blks_hit{%s}[5m]) + rate(pg_stat_database_blks_read{%s}[5m])) * 100` $p $p $p))
+        (dict "g" "2_db"   "n" "seqscan_rows_pct"        "u" "%"   "q" (printf `sum(rate(pg_stat_database_tup_returned{%s}[5m])) / sum(rate(pg_stat_database_tup_returned{%s}[5m]) + rate(pg_stat_database_tup_fetched{%s}[5m])) * 100` $p $p $p))
+        (dict "g" "2_db"   "n" "temp_bytes_per_s"        "u" "B/s" "q" (printf `sum(rate(pg_stat_database_temp_bytes{%s}[5m]))` $p))
+        (dict "g" "2_db"   "n" "deadlocks_per_s"         "u" "/s"  "q" (printf `sum(rate(pg_stat_database_deadlocks{%s}[5m]))` $p))
+        (dict "g" "2_db"   "n" "checkpoints_req_pct"     "u" "%"   "q" (printf `sum(rate(pg_stat_bgwriter_checkpoints_req_total{%s}[1h])) / sum(rate(pg_stat_bgwriter_checkpoints_req_total{%s}[1h]) + rate(pg_stat_bgwriter_checkpoints_timed_total{%s}[1h])) * 100` $p $p $p))
+        (dict "g" "2_db"   "n" "buffers_backend_per_s"   "u" "/s"  "q" (printf `sum(rate(pg_stat_bgwriter_buffers_backend_total{%s}[5m]))` $p))
+        (dict "g" "2_db"   "n" "wal_size_bytes"          "u" "B"   "q" (printf `max(pg_wal_size_bytes{%s})` $p))
+
+        (dict "g" "3_repl" "n" "replication_lag_sec"     "u" "s"   "q" (printf `max(pg_replication_lag_seconds{%s})` $p))
+        (dict "g" "3_repl" "n" "replica_behind_bytes"    "u" "B"   "q" (printf `max(pg_stat_replication_pg_wal_lsn_diff{%s})` $p))
+        (dict "g" "3_repl" "n" "conflicts_per_s"         "u" "/s"  "q" (printf `sum(rate(pg_stat_database_conflicts{%s}[5m]))` $p))
+        (dict "g" "3_repl" "n" "slot_retained_wal_bytes" "u" "B"   "q" (printf `max(pg_replication_slots_pg_wal_lsn_diff{%s})` $p))
+        (dict "g" "3_repl" "n" "inactive_slots"          "u" ""    "q" (printf `count(pg_replication_slots_active{%s} == 0) or vector(0)` $p))
+    }}
+    {{- range $i, $t := $trend }}{{ if $i }} or {{ end }}
+    {{ template "tag" (dict "e" (printf `avg_over_time((%s)[%s:%s])` $t.q $w $s) "n" $t.n "u" $t.u "g" $t.g "o" (printf "%02d" $i)) }}
+    or {{ template "tag" (dict "e" (printf `avg_over_time((%s)[%s:%s] offset %s)` $t.q $w $s $c) "n" (printf "%s_base" $t.n) "u" $t.u "g" $t.g "o" (printf "%02d" $i)) }}
+    {{- end }}
+    or label_replace(max(pg_up{{ "{" }}{{ $p }}{{ "}" }}), "stat", "pg_up", "", "")
+    or label_replace(max by (role) (pg_up{{ "{" }}{{ $p }}{{ "}" }}), "stat", "role", "", "")
+    or label_replace(max by (short_version) (pg_static{{ "{" }}{{ $p }}{{ "}" }}), "stat", "version", "", "")
+  time: now-1d
+response:
+  jq: |
+    (.result | map(select(.metric.stat != null))) as $rows
+    | ($rows | map({key: .metric.stat, value: .}) | from_entries) as $r
+    | def val($k): if $r[$k] then ($r[$k].value[1] | tonumber) else null end;
+    {
+      pg_up: val("pg_up"),
+      role: ($r.role.metric.role // null),
+      version: ($r.version.metric.short_version // null),
+      groups: (
+        $rows
+        | map(select(.metric.grp != null and (.metric.stat | endswith("_base") | not)))
+        | sort_by(.metric.ord)
+        | group_by(.metric.grp)
+        | map({
+            group: (.[0].metric.grp | .[2:]),
+            signals: map(
+              . as $s
+              | {name: $s.metric.stat, unit: $s.metric.unit,
+                 now: val($s.metric.stat), base: val($s.metric.stat + "_base")}
+              | .change_pct = (if .now != null and .base != null and .base != 0
+                               then (.now - .base) / .base * 100
+                               elif .now != null and .base == 0 and .now != 0 then 100
+                               else null end)
+            )
+          })
+      )
+    }
+  render: |-
+    {{- define "num" }}{{ if eq .v nil }}n/a{{ else if or (eq .u "B") (eq .u "B/s") }}{{ printf "%.0f" (float64 .v) }}{{ else if eq .u "" }}{{ printf "%.2f" (float64 .v) }}{{ else }}{{ printf "%.2f" (float64 .v) }}{{ end }}{{ if ne .v nil }}{{ .u }}{{ end }}{{ end -}}
+    {{ param "host" }}{{ if .role }} ({{ .role }}{{ if .version }}, PG {{ .version }}{{ end }}){{ end }}{{ if eq .pg_up nil }} — postgres_exporter not found for this host{{ else if eq (float64 .pg_up) 0.0 }} — EXPORTER CANNOT REACH POSTGRES (pg_up=0), database numbers below are stale{{ end }}
+    last {{ param "window" }} vs the same window {{ param "compare" }} ago
+    {{ range .groups }}
+    [{{ .group }}]
+    {{- range .signals }}
+    - {{ .name }}: {{ template "num" (dict "v" .now "u" .unit) }} (was {{ template "num" (dict "v" .base "u" .unit) }}{{ if ne .change_pct nil }}, {{ printf "%+.0f" (float64 .change_pct) }}%{{ if ge (float64 .change_pct) 30.0 }} ▲{{ else if le (float64 .change_pct) -30.0 }} ▼{{ end }}{{ end }})
+    {{- end }}
+    {{ end }}
+    Signals not listed are not collected on this host. Per-table bloat, dead tuples and query latency are outside this tool.

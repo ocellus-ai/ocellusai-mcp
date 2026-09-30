@@ -1,0 +1,17 @@
+# Level 2: jq + render. The agent gets a ready-made text; structuredContent
+# still carries the jq result.
+name: targets_down_summary
+description: |
+  Human-readable summary of scrape targets that are down. Use this when a short
+  status line for a chat message is enough.
+worker: prometheus
+request:
+  type: instant
+  query: up == 0
+response:
+  jq: '[.result[] | {job: .metric.job, instance: .metric.instance}]'
+  render: |
+    {{ if not . }}All targets are up.{{ else }}
+    {{ len . }} target(s) down:
+    {{ range . }}- {{ .job }} @ {{ .instance }}
+    {{ end }}{{ end }}

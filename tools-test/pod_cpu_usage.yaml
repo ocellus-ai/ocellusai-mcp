@@ -1,0 +1,26 @@
+name: pod_cpu_usage
+description: |
+  CPU usage (cores) per pod in a namespace, averaged over the last window.
+  Returns the top N pods sorted by usage, highest first.
+worker: prometheus
+
+params:
+  namespace: {type: string, required: true, description: "Kubernetes namespace"}
+  window:    {type: string, default: "5m", description: "Rate window such as 5m or 1h", pattern: "^[0-9]+[smhdwy]$"}
+  top:       {type: integer, default: 10, minimum: 1, maximum: 100, description: "How many pods to return"}
+
+request:
+  type: instant
+  query: |
+    topk({{ .top }}, sum by (pod) (
+      rate(container_cpu_usage_seconds_total{namespace={{ promLabel .namespace }}, container!=""}[{{ promDuration .window }}])
+    ))
+
+response:
+  jq: |
+    [.result[] | {pod: .metric.pod, cores: (.value[1] | tonumber)}] | sort_by(-.cores)
+  render: |
+    {{ if not . }}No CPU samples for namespace {{ param "namespace" }} in the last {{ param "window" }}.{{ else }}
+    Top {{ len . }} pods by CPU in {{ param "namespace" }} (last {{ param "window" }}):
+    {{ range . }}{{ .pod }}: {{ printf "%.3f" (float64 .cores) }} cores
+    {{ end }}{{ end }}

@@ -1,0 +1,154 @@
+# Multivariate SSA (processor ssa_mv) of five node_exporter signals per VM
+# decomposed together: the cycles the signals share, those only one of them
+# has, and a joint forecast. The history must hold several periods of the
+# main cycle: four days for a daily one by default.
+# Assumes node_exporter scraped as job="node_exporters"; adjust the selectors
+# to your setup.
+name: node_mssa
+description: |
+  Decomposes five signals of each virtual machine (node_exporter: cpu busy %,
+  memory used %, load1 per core, network receive and transmit Mbit/s) over
+  the `range` ending at `at` together, by multivariate Singular Spectrum
+  Analysis: the trend and the cycles the signals share, and those only one
+  of them has. Every signal is first brought to one scale (its standard
+  deviation, at least its minimum meaningful change), so a signal in bytes
+  does not drown one in percent. Returns per VM the structure with the share
+  of each signal's movement every component carries (only shares of 5% and
+  more are listed), how much of each signal the structure explains, warnings,
+  and the joint forecast `horizon` ahead: every signal's value at the end and
+  its peak. `window` should be a multiple of the main period (1d for a daily
+  cycle) and `range` at least three periods.
+  Every VM also gets, per signal, its stretches away from its usual daily
+  profile (the median of the same time of day over the days around a robust
+  level) larger than the signal's minimum meaningful change (cpu 5 pts, mem 3
+  pts, load 0.25, net 5 Mbit/s): `regime` lists stretches of 2 h or longer
+  (an outage, a catch-up) with their UTC times - they distort the trend, the
+  periods and the forecast, so re-run with `at`/`range` outside them; `daily`
+  lists stretches that recur at one time of day (a scheduled job); `bursts`
+  counts the shorter ones. A main period far from 24 h or 12 h, or one that
+  changes between calls, usually means such a stretch inside `range`: look at
+  the series with node_signal_window before trusting it. VMs are listed
+  by the forecast cpu peak, trusted ones first: those with an unstable
+  forecast or another regime in the history come last. `details: true` adds
+  every finding of the analysis.
+params:
+  instance: {type: string, default: ".*", description: "Regex over the instance label, e.g. web-.*"}
+  at:       {type: string, default: "now", description: "End of the history: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:    {type: string, default: "4d", description: "History ending at `at`, at least three periods of the main cycle, e.g. 4d or 3d12h", pattern: "^([0-9]+[smhdwy])+$"}
+  step:     {type: string, default: "5m", description: "Sample resolution such as 1m, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  window:   {type: string, default: "1d", description: "SSA window, a multiple of the main period; a duration such as 1d or 1d4h5m as the findings suggest it", pattern: "^([0-9]+[smhdwy])+$"}
+  horizon:  {type: string, default: "1d", description: "How far past `at` to forecast, e.g. 1d or 6h30m", pattern: "^([0-9]+[smhdwy])+$"}
+  groups:   {type: string, default: "", pattern: "^[0-9,; -]*$", description: "Components to keep and forecast, e.g. 0;1-2 (default: every trend and harmonic above the noise)"}
+  top:      {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many VMs to list"}
+  details:  {type: boolean, default: false, description: "Also list every info finding of the analysis (noise model, groups), not only the warnings"}
+
+calls:
+  - name: cpu
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}}[5m])))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: mem
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        max by (instance) (100 * (1 - node_memory_MemAvailable_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}
+                                    / node_memory_MemTotal_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: load
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        max by (instance) (node_load1{job="node_exporters", instance=~{{ promLabel .instance }}})
+          / count by (instance) (node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}})
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: net_rx
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        8 * sum by (instance) (rate(node_network_receive_bytes_total{job="node_exporters", instance=~{{ promLabel .instance }}, device!~"lo|veth.*|docker.*|br.*|virbr.*|cali.*|flannel.*|cilium.*|lxc.*"}[5m])) / 1e6
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: net_tx
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        8 * sum by (instance) (rate(node_network_transmit_bytes_total{job="node_exporters", instance=~{{ promLabel .instance }}, device!~"lo|veth.*|docker.*|br.*|virbr.*|cali.*|flannel.*|cilium.*|lxc.*"}[5m])) / 1e6
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+
+process:
+  - fn: join                         # five matrices → one (cpu, mem, load, net_rx, net_tx) series per instance
+    with:
+      inputs: [cpu, mem, load, net_rx, net_tx]
+      join_by: [instance]
+  - fn: ssa_mv
+    with:
+      window: "{{ .window }}"
+      forecast: "{{ .horizon }}"
+      groups: "{{ .groups }}"
+      # the smallest meaningful change of each signal (as in node_deep_ensemble): a signal
+      # that moves less is scaled by it, so its jitter does not pull the common components;
+      # a stretch away from the usual daily profile must exceed it to be listed
+      min_delta: {cpu: 5, mem: 3, load: 0.25, net_rx: 5, net_tx: 5}
+      clip: {cpu: [0, 100], mem: [0, 100], load: [0, 1e6], net_rx: [0, 1e15], net_tx: [0, 1e15]}
+      min_points: 288                # at least a day of 5m samples
+
+response:
+  jq: |
+    def hm: (. / 60 | round) as $m | if $m >= 60 then "\($m / 60 | floor)h\(if $m % 60 > 0 then "\($m % 60)m" else "" end)" else "\($m)m" end;
+    def at: .[5:16] | sub("T"; " ");
+    def num: . * 100 | round / 100;
+    {
+      analyzed: .series_analyzed,
+      skipped: [ .series[] | select(.skipped) | {instance: .labels.instance, reason} ],
+      vms: [ .series[] | select(.skipped | not)
+             | .forecast as $f | .grid_points as $n
+             | {instance: .labels.instance,
+                structure: [ .components[] | select(.borderline | not)
+                             | "\(.group) \(.meaning) [\([.variance_share | to_entries[] | select((.value // 0) >= 0.05) | "\(.key) \((.value * 100) | floor)%"] | join(", "))]" ],
+                explained: (.residual.explained // {} | to_entries | map("\(.key) \(((.value // 0) * 100) | floor)%") | join(", ")),
+                off: (.residual.spikes // {} | to_entries | map(select(.value / $n >= 0.01) | "\(.key) \(.value / $n * 1000 | round / 10)%") | join(", ")),
+                broken,
+                regime: [ .runs[] | select(.kind == "long")
+                          | {dim, from: .start_time, to: .end_time, deviation,
+                             text: "\(.dim) \(.start_time | at)..\(.end_time | at) \(if .deviation < 0 then "below" else "above" end) by \(.deviation | fabs | num) (\(.duration | hm))"} ],
+                daily: [ .recurring[] | {dim, time_of_day, days, of_days, deviation,
+                          text: "\(.dim) ~\(.time_of_day) UTC ±\(.spread | hm) on \(.days)/\(.of_days) days, ~\(.duration | hm), \(if .deviation < 0 then "below" else "above" end) by \(.deviation | fabs | num)"} ],
+                bursts: ([ .runs[] | select(.kind == "burst") | .dim ] | group_by(.) | map("\(.[0]) \(length)") | join(", ")),
+                warnings: [ .findings[] | select(.level == "warn") | .text ],
+                notes: (if $params.details then [ .findings[] | select(.level == "info") | .text ] else [] end),
+                forecast: (if $f.points then
+                             {group: $f.group, end_time: $f.end_time, left_out: [ ($f.left_out // [])[] as $c | select([ ($f.growing // [])[].components[] ] | any(. == $c) | not) | $c ], growing: [ ($f.growing // [])[] | "\(.group) (period \(.period_seconds / 3600 * 10 | round / 10) h, x\(.growth * 10 | round / 10) over the horizon)" ], warning: ($f.warning // ""),
+                              cpu_peak: ($f.points | map(.[1]) | max),
+                              last: ([.dims // ["cpu", "mem", "load", "net_rx", "net_tx"], ($f.points[-1][1:])] | transpose | map("\(.[0]) \(.[1] | num)") | join(", "))}
+                           else {reason: $f.reason} end)}
+             | .trust = (if .broken or ((.forecast.warning // "") != "") then 2 elif .off != "" then 1 else 0 end) ]
+           | sort_by(.trust, -(.forecast.cpu_peak // -1e308)) | .[:$params.top]
+    }
+  render: |
+    {{ .analyzed }} VM(s) analyzed: cpu, mem, load, net_rx, net_tx over {{ param "range" }} to {{ param "at" }} (window {{ param "window" }}, forecast {{ param "horizon" }} ahead){{ if .skipped }}; {{ len .skipped }} skipped{{ end }}.
+    {{ range .vms }}{{ .instance }}: the structure explains {{ .explained }}{{ if .off }}; points off the structure: {{ .off }}{{ end }}.
+    {{ range .structure }}  {{ . }}
+    {{ end }}{{ if .regime }}  another regime (the trend, periods and forecast are distorted; re-run outside it): {{ range $i, $r := .regime }}{{ if $i }}; {{ end }}{{ $r.text }}{{ end }}
+    {{ end }}{{ range .daily }}  recurs daily (a scheduled job): {{ .text }}
+    {{ end }}{{ if .bursts }}  shorter bursts off the usual daily profile: {{ .bursts }}
+    {{ end }}{{ with .forecast }}{{ if hasKey . "reason" }}  forecast: {{ .reason }}{{ else }}  forecast of {{ .group }}{{ if .left_out }} (without {{ join "," .left_out }}: no stable continuation){{ end }}{{ if .growing }} (without the growing pair(s) {{ join "; " .growing }}){{ end }} to {{ .end_time }}: cpu peak {{ printf "%.1f" (float64 .cpu_peak) }}%; at the end {{ .last }}{{ if .warning }}
+      warning: {{ .warning }}{{ end }}{{ end }}{{ end }}
+    {{ range .warnings }}  warning: {{ . }}
+    {{ end }}{{ range .notes }}  note: {{ . }}
+    {{ end }}{{ end }}

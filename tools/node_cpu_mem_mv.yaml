@@ -1,0 +1,90 @@
+# Two range calls (CPU busy %, memory used %) joined per VM by the join
+# transform, Mahalanobis distance over the (cpu, mem) pairs. Same shape as
+# internal/processor/anomalymv/testdata, with `at`.
+# Assumes node_exporter scraped as job="node_exporters"; adjust the selectors
+# to your setup.
+name: node_cpu_mem_mv
+description: |
+  Joint CPU+memory anomalies per virtual machine (node_exporter) over the
+  `range` ending at `at`: samples whose (cpu busy %, memory used %) pair is
+  unusual for that VM's own history even when each metric alone stays in its
+  normal band, e.g. memory climbing while CPU stays flat. Returns, per VM with
+  anomalies, the count and the strongest samples with time, both values, the
+  expected values, which metric deviates most and the score (Mahalanobis
+  distance, roughly standard deviations). A quarter of `min_delta` is the
+  noise floor of each metric, so a nearly constant VM does not turn a tiny
+  blip into a large distance and is analysed rather than skipped (with
+  `min_delta: 0` a VM whose CPU or memory never changes is skipped as
+  singular). Raise `threshold` to keep only extreme cases.
+params:
+  instance:  {type: string, default: ".*", description: "Regex over the instance label, e.g. web-.*"}
+  at:        {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:     {type: string, default: "6h", description: "Look-back range ending at `at`, e.g. 2h, 1d", pattern: "^[0-9]+[smhdwy]$"}
+  step:      {type: string, default: "60s", description: "Sample resolution such as 30s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  threshold: {type: number, default: 4, minimum: 0.5, maximum: 20, description: "Mahalanobis distance above which a sample is anomalous"}
+  top:       {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many VMs to list, most anomalous first"}
+  min_delta: {type: number, default: 3, minimum: 0, maximum: 100, description: "Ignore anomalies where neither cpu nor mem moved by at least this many percentage points from the expected value (noise of nearly constant VMs)"}
+
+calls:
+  - name: cpu
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}}[5m])))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: mem
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        # max by (instance): a relabelling inside the window (a changed role label, say) leaves
+        # two series for one instance, which join rejects
+        max by (instance) (100 * (1 - node_memory_MemAvailable_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}
+                                    / node_memory_MemTotal_bytes{job="node_exporters", instance=~{{ promLabel .instance }}}))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+
+process:
+  - fn: join                         # {cpu: matrix, mem: matrix} → one (cpu, mem) series per instance
+    with:
+      inputs: [cpu, mem]
+      join_by: [instance]
+  - fn: anomaly_mv
+    with:
+      method: mahalanobis
+      threshold: "{{ .threshold }}"
+      min_points: 30
+      min_delta: "{{ .min_delta }}"  # points, both dims: a quarter of it is added to the covariance diagonal as a noise floor
+      max_anomalies: 0               # keep everything; the response filters by min_delta and cuts to 3 per VM
+
+response:
+  jq: |
+    [ .series[] | select(.skipped | not)
+      | .anomalies |= map(select(((.values.cpu - .expected.cpu) | fabs) >= $params.min_delta
+                                 or ((.values.mem - .expected.mem) | fabs) >= $params.min_delta))
+      | select((.anomalies | length) > 0)
+      | {instance: .labels.instance, points, count: (.anomalies | length),
+         corr: .stats.corr_cpu_mem, max_distance: .stats.max_distance,
+         anomalies: (.anomalies | sort_by(-.score) | .[:3] | sort_by(.timestamp) | map({time, values, expected, deviation, dominant, score}))}
+    ] as $vms
+    | {
+      at: $params.at, range: $params.range,
+      vms_total: .series_total, vms_analyzed: .series_analyzed, vms_skipped: .series_skipped,
+      raw_total: .total_anomalies,
+      total: ([$vms[].count] | add // 0),
+      vms_with_anomalies: ($vms | length),
+      skipped: [ .series[] | select(.skipped) | {instance: .labels.instance, reason} ],
+      vms: ($vms | sort_by(-.count, -.max_distance) | .[:$params.top])
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No joint CPU/memory anomalies among {{ .vms_analyzed }} VM(s) matching {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }} (Mahalanobis threshold {{ param "threshold" }}, moves under {{ param "min_delta" }} points ignored: {{ .raw_total }} raw; {{ .vms_skipped }} skipped).{{ else }}
+    {{ .total }} anomalous (cpu, mem) sample(s) on {{ .vms_with_anomalies }} of {{ .vms_analyzed }} VM(s) over the {{ param "range" }} ending at {{ .at }} (Mahalanobis distance > {{ param "threshold" }}, moves under {{ param "min_delta" }} points ignored: {{ .raw_total }} raw; {{ .vms_skipped }} skipped). Top {{ len .vms }}:
+    {{ range .vms }}{{ .instance }}: {{ .count }} anomaly(ies), cpu/mem correlation {{ if kindIs "invalid" .corr }}n/a{{ else }}{{ printf "%.2f" (float64 .corr) }}{{ end }}, max distance {{ printf "%.1f" (float64 .max_distance) }}
+    {{ range .anomalies }}  - {{ .time }} cpu {{ printf "%.1f" (float64 .values.cpu) }}% (expected {{ printf "%.1f" (float64 .expected.cpu) }}), mem {{ printf "%.1f" (float64 .values.mem) }}% (expected {{ printf "%.1f" (float64 .expected.mem) }}), driven by {{ .dominant }} ({{ printf "%+.1f" (float64 (index .deviation .dominant)) }} sigma), score {{ printf "%.1f" (float64 .score) }}
+    {{ end }}{{ end }}{{ end }}
+    {{- if .skipped }}
+    Skipped VM(s): {{ range $i, $s := .skipped }}{{ if $i }}, {{ end }}{{ $s.instance }} ({{ $s.reason }}){{ end }}{{ end }}

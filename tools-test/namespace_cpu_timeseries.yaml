@@ -1,0 +1,23 @@
+# Range query example: start/end/step are templates; "now-<duration>" is supported.
+name: namespace_cpu_timeseries
+description: |
+  Total CPU (cores) of a namespace as a time series over the last `range`
+  with the given `step`. Returns [{"ts": unix_seconds, "cores": number}].
+worker: prometheus
+
+params:
+  namespace: {type: string, required: true}
+  range:     {type: string, default: "1h", description: "Look-back range such as 30m, 6h", pattern: "^[0-9]+[smhdwy]$"}
+  step:      {type: string, default: "60s", description: "Resolution step such as 15s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+
+request:
+  type: range
+  query: |
+    sum(rate(container_cpu_usage_seconds_total{namespace={{ promLabel .namespace }}, container!=""}[5m]))
+  start: "now-{{ promDuration .range }}"
+  end: now
+  step: "{{ .step }}"
+
+response:
+  jq: |
+    [.result[0].values[]? | {ts: .[0], cores: (.[1] | tonumber)}]

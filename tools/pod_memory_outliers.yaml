@@ -1,0 +1,67 @@
+# Instant vector at `at` → jq → outliers with group_by over two labels
+# (cluster, namespace): each pod is compared with the other pods of the same
+# namespace in the same cluster, not with its own history. min_delta keeps an
+# outlier only if it is `min_mib` above the group's median, so a namespace of
+# 10 MiB pods does not report a 40 MiB one. Assumes cAdvisor metrics scraped
+# as job="kubelet" and a `cluster` label.
+name: pod_memory_outliers
+description: |
+  Pods whose working-set memory stands out from the other pods of the same
+  namespace in the same Kubernetes cluster at time `at` (IQR fences over the
+  pods of each cluster+namespace group, no fixed threshold). Returns, per
+  group, how many pods were compared, the median and the outliers with pod,
+  bytes, direction (up = bigger than the rest) and score; an outlier must
+  also differ from the group's median by at least `min_mib`. Groups with
+  fewer than 5 pods are skipped. `namespace` and `cluster` are regexes, so one
+  call can compare several namespaces across all clusters.
+worker: prometheus
+
+params:
+  namespace:   {type: string, default: "kube-system", description: "Regex over the namespace label"}
+  cluster:     {type: string, default: ".*", description: "Regex over the cluster label, e.g. prod-.*"}
+  at:          {type: string, default: "now", description: "Evaluation time: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  sensitivity: {type: number, default: 1.5, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k: 1.5 = standard outliers, 3 = only extreme ones"}
+  direction:   {type: string, default: "up", enum: [both, up, down], description: "up = memory hogs, down = unusually small pods, both"}
+  min_mib:     {type: number, default: 100, minimum: 0, maximum: 1048576, description: "Smallest difference from the group's median pod worth reporting, MiB"}
+
+request:
+  type: instant
+  query: |
+    sum by (cluster, namespace, pod) (
+      container_memory_working_set_bytes{job="kubelet", container!="", pod!="", namespace=~{{ promLabel .namespace }}, cluster=~{{ promLabel .cluster }}}
+    )
+  time: "{{ .at }}"
+
+process:
+  - fn: jq
+    with:
+      expr: '[.result[] | {key: .metric.pod, value: .value[1], labels: {cluster: .metric.cluster, namespace: .metric.namespace}}]'
+  - fn: outliers
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      group_by: [cluster, namespace]
+      direction: "{{ .direction }}"
+      min_points: 5
+      min_delta: "{{ mulf .min_mib 1048576 }}"   # bytes from the median; applied before the cap
+      max_anomalies: 5
+
+response:
+  jq: |
+    {
+      at: $params.at,
+      groups_total: .series_total, groups_analyzed: .series_analyzed, groups_skipped: .series_skipped, total: .total_anomalies,
+      below_min: ([.series[].below_min_delta // 0] | add // 0),
+      groups: [ .series[] | {cluster: .labels.cluster, namespace: .labels.namespace, pods: .points, skipped, reason,
+                            median: .stats.median, upper: .stats.upper,
+                            outliers: [.anomalies[] | {pod: .key, bytes: .value, direction, score}]} ]
+              | sort_by(-(.outliers | length), -.pods)
+    }
+  render: |
+    {{- define "mib" }}{{ printf "%.0f MiB" (divf (float64 .) 1048576.0) }}{{ end -}}
+    {{ if eq (int .groups_total) 0 }}No pods matched namespace {{ param "namespace" }} / cluster {{ param "cluster" }} at {{ .at }}.{{ else }}Pod memory outliers at {{ .at }} (IQR k={{ param "sensitivity" }}, direction {{ param "direction" }}, at least {{ param "min_mib" }} MiB from the median): {{ .total }} outlier(s) in {{ .groups_analyzed }} group(s){{ if .below_min }} ({{ .below_min }} closer to the median ignored){{ end }}, {{ .groups_skipped }} group(s) skipped.
+    {{ range .groups }}
+    {{ .cluster }} / {{ .namespace }}: {{ .pods }} pod(s){{ if .skipped }}, skipped ({{ .reason }}){{ else }}, median {{ template "mib" .median }}, upper fence {{ template "mib" .upper }}{{ if not .outliers }}, no outliers{{ end }}{{ end }}
+    {{- range .outliers }}
+      - {{ .pod }}: {{ template "mib" .bytes }} ({{ .direction }}, score {{ printf "%.1f" (float64 .score) }})
+    {{- end }}{{ end }}{{ end }}

@@ -1,0 +1,66 @@
+# increase() over kube-state-metrics restart counters at `at`, grouped per
+# cluster. Most pods restart 0 times, so the IQR collapses to 0 and the score
+# becomes the distance in restarts (the zero-IQR branch of the iqr detector).
+# min_delta (`min_restarts` above the cluster's median) states which count is
+# worth reporting when many pods restart and the fences no longer sit at
+# zero. Assumes a `cluster` label on kube-state-metrics.
+name: pod_restart_outliers
+description: |
+  Pods that restarted unusually often compared with the other pods of the
+  same Kubernetes cluster during the `range` ending at `at`: container
+  restarts per pod (kube-state-metrics increase) with IQR fences over each
+  cluster. Because most pods never restart, the fences usually collapse to
+  zero and every pod with at least `min_restarts` restarts is listed,
+  strongest first, with the score equal to the number of restarts. Returns, per cluster, the number of pods
+  compared, the median and the outliers with namespace/pod, restarts and
+  score.
+worker: prometheus
+
+params:
+  cluster:     {type: string, default: ".*", description: "Regex over the cluster label"}
+  at:          {type: string, default: "now", description: "Evaluation time: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:       {type: string, default: "1d", description: "How far back restarts are counted, e.g. 6h, 1d, 3d", pattern: "^[0-9]+[smhdwy]$"}
+  sensitivity: {type: number, default: 1.5, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k"}
+  top:         {type: integer, default: 10, minimum: 1, maximum: 100, description: "Outliers to list per cluster"}
+  min_restarts: {type: number, default: 1, minimum: 0, maximum: 100000, description: "Smallest number of restarts above the cluster's median worth reporting; raise it to 2+ to drop single restarts"}
+
+request:
+  type: instant
+  query: |
+    sum by (cluster, namespace, pod) (
+      increase(kube_pod_container_status_restarts_total{cluster=~{{ promLabel .cluster }}}[{{ promDuration .range }}])
+    )
+  time: "{{ .at }}"
+
+process:
+  - fn: jq
+    with:
+      expr: '[.result[] | {key: (.metric.namespace + "/" + .metric.pod), value: .value[1], labels: {cluster: .metric.cluster}}]'
+  - fn: outliers
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      group_by: cluster
+      direction: up
+      min_points: 10
+      min_delta: "{{ .min_restarts }}"   # restarts above the median; applied before the cap
+      max_anomalies: "{{ .top }}"
+
+response:
+  jq: |
+    {
+      at: $params.at, range: $params.range,
+      clusters_total: .series_total, clusters_skipped: .series_skipped, total: .total_anomalies,
+      below_min: ([.series[].below_min_delta // 0] | add // 0),
+      clusters: [ .series[] | {cluster: .labels.cluster, pods: .points, skipped, reason,
+                              median: .stats.median, iqr: .stats.iqr, upper: .stats.upper, max: .stats.max,
+                              outliers: [.anomalies[] | {pod: .key, restarts: .value, score}]} ]
+                | sort_by(-(.outliers | length))
+    }
+  render: |
+    {{ if eq (int .clusters_total) 0 }}No pods matched cluster {{ param "cluster" }} at {{ .at }}.{{ else }}Pod restart outliers over the {{ param "range" }} ending at {{ .at }} (IQR k={{ param "sensitivity" }} per cluster, at least {{ param "min_restarts" }} above the median): {{ .total }} pod(s) stand out{{ if .below_min }} ({{ .below_min }} with fewer restarts ignored){{ end }}{{ if .clusters_skipped }}, {{ .clusters_skipped }} cluster(s) skipped{{ end }}.
+    {{ range .clusters }}
+    {{ .cluster }}: {{ .pods }} pod(s){{ if .skipped }}, skipped ({{ .reason }}){{ else }}, median {{ printf "%.1f" (float64 .median) }} restarts, IQR {{ printf "%.1f" (float64 .iqr) }}, upper fence {{ printf "%.1f" (float64 .upper) }}, max {{ printf "%.0f" (float64 .max) }}{{ if not .outliers }}, no outliers{{ end }}{{ end }}
+    {{- range .outliers }}
+      - {{ .pod }}: {{ printf "%.0f" (float64 .restarts) }} restart(s) (score {{ printf "%.1f" (float64 .score) }})
+    {{- end }}{{ end }}{{ end }}

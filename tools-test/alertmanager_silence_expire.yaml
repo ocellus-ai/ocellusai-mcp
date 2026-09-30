@@ -1,0 +1,19 @@
+# REST worker, action: DELETE with a parameter in the path. pathEscape keeps
+# the value one path segment; the pattern rejects anything but an id anyway.
+name: alertmanager_silence_expire
+description: |
+  Expire (delete) an Alertmanager silence by id, so the silenced alerts notify again.
+  This is an action. Use alertmanager_silences to find the id.
+  Returns {"id","status"}.
+worker: rest
+
+params:
+  id: {type: string, required: true, pattern: "^[A-Za-z0-9-]+$", description: "Silence id"}
+
+request:
+  method: DELETE
+  path: /silence/{{ pathEscape .id }}
+
+response:                          # . = {status, headers, body: null}
+  jq: '{id: $params.id, status: .status}'
+  render: 'Silence {{ .id }} expired (HTTP {{ .status }}).'

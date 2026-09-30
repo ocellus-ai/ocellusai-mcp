@@ -1,0 +1,5 @@
+bin/
+deploy/
+*.md
+.git/
+.golangci.yml

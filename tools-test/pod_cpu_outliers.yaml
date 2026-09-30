@@ -1,0 +1,49 @@
+# process: jq + outliers over an instant Prometheus vector — one metric
+# across many pods at one moment, each pod compared with the other pods
+# (a cross-section). For a pod compared with its own history over time see
+# pod_cpu_anomalies (range query + anomaly).
+name: pod_cpu_outliers
+description: |
+  Pods of a namespace whose current CPU usage (cores, averaged over the last
+  `window`) stands out from the other pods of the namespace right now: IQR
+  fences over all pods, no fixed threshold. Returns how many pods were
+  compared, the typical (median) CPU and the outliers with pod, cores,
+  direction (up = busier than the rest, down = idler) and score. Use it to
+  find the hot pod behind an uneven load; lower `sensitivity` to catch more,
+  raise it to keep only extreme ones. For a pod's deviation from its own
+  history use pod_cpu_anomalies.
+worker: prometheus
+
+params:
+  namespace:   {type: string, required: true, description: "Kubernetes namespace"}
+  window:      {type: string, default: "5m", description: "Rate window such as 5m or 1h", pattern: "^[0-9]+[smhdwy]$"}
+  sensitivity: {type: number, default: 1.5, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k: 1.5 = standard outliers, 3 = only extreme ones"}
+
+request:
+  type: instant
+  query: |
+    sum by (pod) (rate(container_cpu_usage_seconds_total{namespace={{ promLabel .namespace }}, container!=""}[{{ promDuration .window }}]))
+
+process:
+  - fn: jq
+    with:
+      # Prometheus vector → canonical items: the sample value is a string, the
+      # processor accepts numeric strings as is.
+      expr: '[.result[] | {key: .metric.pod, value: .value[1]}]'
+  - fn: outliers
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      min_points: 5
+      max_anomalies: 10
+
+response:
+  jq: |
+    .series[0] as $s
+    | {pods: $s.points, skipped: $s.skipped, reason: $s.reason, median: $s.stats.median,
+       outliers: [$s.anomalies[] | {pod: .key, cores: .value, direction, score}]}
+  render: |
+    {{ if .skipped }}Not enough pods in namespace {{ param "namespace" }} to compare ({{ .reason }}).{{ else if not .outliers }}No outlying pods among {{ .pods }} in namespace {{ param "namespace" }} (median {{ printf "%.3f" (float64 .median) }} cores over the last {{ param "window" }}).{{ else }}
+    {{ len .outliers }} outlying pod(s) among {{ .pods }} in namespace {{ param "namespace" }} over the last {{ param "window" }} (median {{ printf "%.3f" (float64 .median) }} cores, IQR fences k={{ param "sensitivity" }}):
+    {{ range .outliers }}{{ .pod }}: {{ printf "%.3f" (float64 .cores) }} cores ({{ .direction }}, score {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}

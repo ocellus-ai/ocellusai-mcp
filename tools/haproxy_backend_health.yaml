@@ -1,0 +1,56 @@
+# One instant query built from ten sub-expressions tagged with a synthetic
+# `stat` label (label_replace idiom), regrouped in jq into one row per backend
+# and rendered as a ranked list. No anomaly detection: PromQL, jq and a
+# template only. Assumes haproxy_exporter scraped as job="haproxy-exporter".
+name: haproxy_backend_health
+description: |
+  Health of every HAProxy backend (proxy) at time `at`, rates averaged over
+  `window`: requests/s, share of 5xx and 4xx responses, response and
+  connection errors/s, retries+redispatches/s, current sessions and queue,
+  active servers and the average backend response time. Backends are sorted
+  by 5xx share, then by request rate; the `stats` backend is excluded.
+  `instance` and `proxy` are regexes. Use it to find the backend behind a
+  burst of errors or a queue build-up.
+worker: prometheus
+
+params:
+  instance: {type: string, default: ".*", description: "Regex over the haproxy instance label"}
+  proxy:    {type: string, default: ".*", description: "Regex over the backend (proxy) name, e.g. api_.*"}
+  at:       {type: string, default: "now", description: "Evaluation time: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  window:   {type: string, default: "5m", description: "Rate window such as 5m or 1h", pattern: "^[0-9]+[smhdwy]$"}
+  top:      {type: integer, default: 20, minimum: 1, maximum: 200, description: "How many backends to list"}
+
+request:
+  type: instant
+  query: |
+    {{- $sel := printf `job="haproxy-exporter", proxy!="stats", instance=~%s, proxy=~%s` (promLabel .instance) (promLabel .proxy) }}
+    {{- $w := promDuration .window }}
+    label_replace(sum by (instance, proxy) (rate(haproxy_backend_http_responses_total{ {{ $sel }} }[{{ $w }}])), "stat", "req_ps", "", "")
+    or label_replace(100 * sum by (instance, proxy) (rate(haproxy_backend_http_responses_total{ {{ $sel }}, code="5xx"}[{{ $w }}])) / (sum by (instance, proxy) (rate(haproxy_backend_http_responses_total{ {{ $sel }} }[{{ $w }}])) > 0), "stat", "err5xx_pct", "", "")
+    or label_replace(100 * sum by (instance, proxy) (rate(haproxy_backend_http_responses_total{ {{ $sel }}, code="4xx"}[{{ $w }}])) / (sum by (instance, proxy) (rate(haproxy_backend_http_responses_total{ {{ $sel }} }[{{ $w }}])) > 0), "stat", "err4xx_pct", "", "")
+    or label_replace(sum by (instance, proxy) (rate(haproxy_backend_response_errors_total{ {{ $sel }} }[{{ $w }}])), "stat", "resp_err_ps", "", "")
+    or label_replace(sum by (instance, proxy) (rate(haproxy_backend_connection_errors_total{ {{ $sel }} }[{{ $w }}])), "stat", "conn_err_ps", "", "")
+    or label_replace(sum by (instance, proxy) (rate(haproxy_backend_retry_warnings_total{ {{ $sel }} }[{{ $w }}]) + rate(haproxy_backend_redispatch_warnings_total{ {{ $sel }} }[{{ $w }}])), "stat", "retries_ps", "", "")
+    or label_replace(sum by (instance, proxy) (haproxy_backend_current_sessions{ {{ $sel }} }), "stat", "sessions", "", "")
+    or label_replace(sum by (instance, proxy) (haproxy_backend_current_queue{ {{ $sel }} }), "stat", "queue", "", "")
+    or label_replace(sum by (instance, proxy) (haproxy_backend_active_servers{ {{ $sel }} }), "stat", "active_servers", "", "")
+    or label_replace(1000 * max by (instance, proxy) (haproxy_backend_response_time_average_seconds{ {{ $sel }} }), "stat", "resp_avg_ms", "", "")
+  time: "{{ .at }}"
+
+response:
+  jq: |
+    def num: .value[1] | tonumber? // null;
+    [ .result
+      | group_by(.metric.instance + "|" + .metric.proxy)[]
+      | {instance: .[0].metric.instance, proxy: .[0].metric.proxy}
+        + (map({key: .metric.stat, value: num}) | from_entries)
+      | .req_ps //= 0 | .err5xx_pct //= 0 | .err4xx_pct //= 0
+    ]
+    | sort_by(-.err5xx_pct, -.req_ps) | .[:$params.top]
+  render: |
+    {{- define "num" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ printf "%.2f" (float64 .) }}{{ end }}{{ end -}}
+    {{- define "int" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ printf "%.0f" (float64 .) }}{{ end }}{{ end -}}
+    {{- define "ms" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ printf "%.1f ms" (float64 .) }}{{ end }}{{ end -}}
+    {{ if not . }}No HAProxy backends matched instance {{ param "instance" }} / proxy {{ param "proxy" }} at {{ param "at" }}.{{ else }}{{ len . }} HAProxy backend(s) at {{ param "at" }}, rates over {{ param "window" }}, worst 5xx share first:
+    {{ range . }}- {{ .proxy }} @ {{ .instance }}: {{ template "num" .req_ps }} req/s, 5xx {{ template "num" .err5xx_pct }}%, 4xx {{ template "num" .err4xx_pct }}%, resp errors {{ template "num" .resp_err_ps }}/s, conn errors {{ template "num" .conn_err_ps }}/s, retries {{ template "num" .retries_ps }}/s, sessions {{ template "int" .sessions }}, queue {{ template "int" .queue }}, active servers {{ template "int" .active_servers }}, avg response {{ template "ms" .resp_avg_ms }}
+    {{ end }}{{ end }}

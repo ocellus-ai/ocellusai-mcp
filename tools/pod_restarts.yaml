@@ -1,0 +1,20 @@
+name: pod_restarts
+description: |
+  Containers that restarted within the window, with the number of restarts.
+  Uses kube-state-metrics (kube_pod_container_status_restarts_total).
+  Returns [] when nothing restarted.
+worker: prometheus
+
+params:
+  namespace: {type: string, required: true}
+  window:    {type: string, default: "1h", pattern: "^[0-9]+[smhdwy]$"}
+
+request:
+  type: instant
+  query: |
+    increase(kube_pod_container_status_restarts_total{namespace={{ promLabel .namespace }}}[{{ promDuration .window }}]) > 0
+
+response:
+  jq: |
+    [.result[] | {pod: .metric.pod, container: .metric.container, restarts: (.value[1] | tonumber | round)}]
+    | sort_by(-.restarts)

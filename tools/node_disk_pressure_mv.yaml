@@ -1,0 +1,107 @@
+# Three range calls (CPU iowait %, busiest disk utilisation %, average I/O
+# latency ms) joined per VM into a 3-dimensional series and scored with the
+# Mahalanobis distance. Shows join with three inputs, a division that is
+# absent (not NaN) when a VM does no I/O, and the noise floor of anomaly_mv:
+# min_delta per dimension adds a quarter of the smallest change worth
+# reporting to the covariance diagonal, so a nearly idle disk does not turn a
+# 0.1 ms blip into a large distance and a VM with a constant dimension is
+# analysed instead of skipped as singular. The same minimum changes filter
+# the report: some dimension moved at least that far from its expected value.
+# Assumes node_exporter scraped as job="node_exporters"; adjust the selectors
+# to your setup.
+name: node_disk_pressure_mv
+description: |
+  Joint storage-pressure anomalies per virtual machine over the `range`
+  ending at `at`: each sample is the triple (cpu iowait %, utilisation % of
+  the busiest disk, average I/O latency ms) and is scored against the VM's
+  own history with the Mahalanobis distance, so a latency jump without a
+  matching utilisation rise (a slow hypervisor datastore) is caught even if
+  each number alone looks ordinary. Returns, per VM with anomalies, the
+  count and the strongest samples with the three values, the expected values,
+  the dominant dimension and the score. A sample is reported only if at
+  least one dimension moved by its minimum (`min_iowait`, `min_util`,
+  `min_await_ms`) from the expected value; the same minimums are the noise
+  floor of the distance, so nearly idle disks do not produce strong scores
+  from tiny blips.
+params:
+  instance:  {type: string, default: ".*", description: "Regex over the instance label, e.g. .*postgres.*"}
+  at:        {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:     {type: string, default: "6h", description: "Look-back range ending at `at`", pattern: "^[0-9]+[smhdwy]$"}
+  step:      {type: string, default: "60s", description: "Sample resolution", pattern: "^[0-9]+[smhdwy]$"}
+  threshold: {type: number, default: 4, minimum: 0.5, maximum: 20, description: "Mahalanobis distance above which a sample is anomalous"}
+  top:       {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many VMs to list"}
+  min_iowait: {type: number, default: 1, minimum: 0, maximum: 100, description: "Smallest iowait change worth reporting, percentage points"}
+  min_util:  {type: number, default: 10, minimum: 0, maximum: 100, description: "Smallest change of the busiest disk's utilisation worth reporting, percentage points"}
+  min_await_ms: {type: number, default: 2, minimum: 0, maximum: 10000, description: "Smallest change of the average I/O latency worth reporting, ms"}
+
+calls:
+  - name: iowait
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * avg by (instance) (rate(node_cpu_seconds_total{mode="iowait", job="node_exporters", instance=~{{ promLabel .instance }}}[5m]))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: disk_util
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * max by (instance) (rate(node_disk_io_time_seconds_total{job="node_exporters", device!~"(sr|loop|ram|zram|fd)[0-9]+", instance=~{{ promLabel .instance }}}[5m]))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: disk_await
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        {{- $d := printf `job="node_exporters", device!~"(sr|loop|ram|zram|fd)[0-9]+", instance=~%s` (promLabel .instance) }}
+        1000 * sum by (instance) (rate(node_disk_read_time_seconds_total{ {{ $d }} }[5m]) + rate(node_disk_write_time_seconds_total{ {{ $d }} }[5m]))
+             / (sum by (instance) (rate(node_disk_reads_completed_total{ {{ $d }} }[5m]) + rate(node_disk_writes_completed_total{ {{ $d }} }[5m])) > 0)
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+
+process:
+  - fn: join
+    with:
+      inputs: [iowait, disk_util, disk_await]
+      join_by: [instance]
+  - fn: anomaly_mv
+    with:
+      method: mahalanobis
+      threshold: "{{ .threshold }}"
+      min_points: 30
+      # the smallest change worth reporting per dimension; a quarter of it is the noise floor on the covariance diagonal
+      min_delta: {iowait: "{{ .min_iowait }}", disk_util: "{{ .min_util }}", disk_await: "{{ .min_await_ms }}"}
+      max_anomalies: 0               # keep everything; the response drops samples below the minimums and cuts to 3 per VM
+
+response:
+  jq: |
+    {iowait: $params.min_iowait, disk_util: $params.min_util, disk_await: $params.min_await_ms} as $min
+    | [ .series[] | select(.skipped | not)
+      | .anomalies |= map(. as $a | select(any($min | keys[]; (($a.values[.] - $a.expected[.]) | fabs) >= $min[.])))
+      | select((.anomalies | length) > 0)
+      | {instance: .labels.instance, points, count: (.anomalies | length), max_distance: .stats.max_distance,
+         anomalies: (.anomalies | sort_by(-.score) | .[:3] | sort_by(.timestamp) | map({time, values, expected, dominant, score}))}
+    ] as $vms
+    | {
+      at: $params.at, range: $params.range, dims,
+      vms_total: .series_total, vms_analyzed: .series_analyzed, vms_skipped: .series_skipped,
+      raw_total: .total_anomalies,
+      total: ([$vms[].count] | add // 0),
+      vms_with_anomalies: ($vms | length),
+      skipped_reasons: ([.series[] | select(.skipped) | .reason] | group_by(.) | map({reason: .[0], count: length}) | sort_by(-.count)),
+      vms: ($vms | sort_by(-.count, -.max_distance) | .[:$params.top])
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No joint storage-pressure anomalies among {{ .vms_analyzed }} VM(s) over the {{ param "range" }} ending at {{ .at }} (threshold {{ param "threshold" }}; moves under {{ param "min_iowait" }} pt iowait, {{ param "min_util" }} pt util and {{ param "min_await_ms" }} ms await ignored: {{ .raw_total }} raw; {{ .vms_skipped }} skipped).{{ else }}
+    {{ .total }} anomalous (iowait, disk util, await) sample(s) on {{ .vms_with_anomalies }} of {{ .vms_analyzed }} VM(s) over the {{ param "range" }} ending at {{ .at }} (Mahalanobis distance > {{ param "threshold" }}; moves under {{ param "min_iowait" }} pt iowait, {{ param "min_util" }} pt util and {{ param "min_await_ms" }} ms await ignored: {{ .raw_total }} raw; {{ .vms_skipped }} skipped). Top {{ len .vms }}:
+    {{ range .vms }}{{ .instance }}: {{ .count }} anomaly(ies), max distance {{ printf "%.1f" (float64 .max_distance) }}
+    {{ range .anomalies }}  - {{ .time }} iowait {{ printf "%.2f" (float64 .values.iowait) }}% (exp {{ printf "%.2f" (float64 .expected.iowait) }}), util {{ printf "%.1f" (float64 .values.disk_util) }}% (exp {{ printf "%.1f" (float64 .expected.disk_util) }}), await {{ printf "%.1f" (float64 .values.disk_await) }} ms (exp {{ printf "%.1f" (float64 .expected.disk_await) }}), driven by {{ .dominant }}, score {{ printf "%.1f" (float64 .score) }}
+    {{ end }}{{ end }}{{ end }}
+    {{- if .skipped_reasons }}
+    Skipped: {{ range $i, $r := .skipped_reasons }}{{ if $i }}; {{ end }}{{ $r.count }} VM(s): {{ $r.reason }}{{ end }}{{ end }}

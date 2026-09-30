@@ -1,0 +1,22 @@
+# Shell worker with parse: lines, for commands without JSON output.
+# Tool parameters are available inside jq as $params.
+name: disk_usage
+description: |
+  Filesystems of the proxy host whose usage is at or above `threshold` percent.
+  Returns [{"fs","used_pct","mount"}].
+worker: shell
+
+params:
+  threshold: {type: integer, default: 80, minimum: 0, maximum: 100}
+
+request:
+  command: df
+  args: [-P]
+  parse: lines
+
+response:
+  jq: |
+    .[1:] | map(split(" +"; ""))
+    | map(select(length >= 6))
+    | map({fs: .[0], used_pct: (.[4] | rtrimstr("%") | tonumber), mount: .[5]})
+    | map(select(.used_pct >= $params.threshold))

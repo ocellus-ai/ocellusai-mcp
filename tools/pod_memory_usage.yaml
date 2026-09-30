@@ -1,0 +1,21 @@
+name: pod_memory_usage
+description: |
+  Current working-set memory per pod in a namespace, in MiB, highest first.
+  Optional `pod` is a regular expression matched against pod names.
+worker: prometheus
+
+params:
+  namespace: {type: string, required: true, description: "Kubernetes namespace"}
+  pod:       {type: string, default: ".*", description: "Regex on pod name (RE2)"}
+  top:       {type: integer, default: 10, minimum: 1, maximum: 100}
+
+request:
+  type: instant
+  query: |
+    topk({{ .top }}, sum by (pod) (
+      container_memory_working_set_bytes{namespace={{ promLabel .namespace }}, pod=~{{ promLabel .pod }}, container!=""}
+    ))
+
+response:
+  jq: |
+    [.result[] | {pod: .metric.pod, mib: ((.value[1] | tonumber) / 1048576 | floor)}] | sort_by(-.mib)

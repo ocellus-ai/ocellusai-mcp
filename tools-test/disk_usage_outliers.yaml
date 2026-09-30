@@ -1,0 +1,49 @@
+# process: jq + outliers over a shell result. The generic jq step turns the
+# `df -P` lines into the canonical [{key, value}] list, then the outlier
+# detector compares every filesystem with the others — there is no time axis
+# and no fixed threshold (that is disk_usage).
+name: disk_usage_outliers
+description: |
+  Filesystems of the proxy host whose usage percentage stands out from the
+  other mounted filesystems (IQR fences over all of them, no fixed
+  threshold). Returns how many filesystems were compared, the typical
+  (median) usage and the outliers with mount point, usage percent, direction
+  (up = fuller than the rest, down = emptier) and score. Use it to spot a
+  volume filling up when the normal level is unknown; lower `sensitivity` to
+  catch more, raise it to keep only extreme ones. For a fixed threshold use
+  disk_usage.
+worker: shell
+
+params:
+  sensitivity: {type: number, default: 1.5, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k: 1.5 = standard outliers, 3 = only extreme ones"}
+  direction:   {type: string, default: both, enum: [both, up, down], description: "both, or only up (fuller than the rest) / down (emptier)"}
+
+request:
+  command: df
+  args: [-P]
+  parse: lines
+
+process:
+  - fn: jq
+    with:
+      expr: |
+        .[1:] | map(split(" +"; "")) | map(select(length >= 6))
+        | map({key: .[5], value: (.[4] | rtrimstr("%") | tonumber)})
+  - fn: outliers
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      direction: "{{ .direction }}"
+      min_points: 4
+      max_anomalies: 10
+
+response:
+  jq: |
+    .series[0] as $s
+    | {filesystems: $s.points, skipped: $s.skipped, reason: $s.reason, median: $s.stats.median,
+       outliers: [$s.anomalies[] | {mount: .key, used_pct: .value, direction, score}]}
+  render: |
+    {{ if .skipped }}Not enough filesystems to compare ({{ .reason }}).{{ else if not .outliers }}No outlying filesystems among {{ .filesystems }} (median usage {{ printf "%.0f" (float64 .median) }}%).{{ else }}
+    {{ len .outliers }} outlying filesystem(s) among {{ .filesystems }} (median usage {{ printf "%.0f" (float64 .median) }}%, IQR fences k={{ param "sensitivity" }}):
+    {{ range .outliers }}{{ .mount }}: {{ printf "%.0f" (float64 .used_pct) }}% ({{ .direction }}, score {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}

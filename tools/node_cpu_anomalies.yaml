@@ -1,0 +1,66 @@
+# One range query over node_exporter, one series per VM, IQR anomaly
+# detection over every VM's own history, level-2 response. The window ends
+# at `at` (now by default), so a past incident can be examined as well.
+# Assumes node_exporter scraped as job="node_exporters"; adjust the selectors
+# to your setup.
+name: node_cpu_anomalies
+description: |
+  CPU busy anomalies per virtual machine (node_exporter) over the `range`
+  that ends at `at`: samples outside the Tukey (IQR) fences of the VM's own
+  history in that window. Returns how many VMs were analysed and, for VMs
+  with anomalies, the count, the typical (median) busy %, the fences and the
+  strongest anomalies with time, value, direction (up/down) and score.
+  `instance` narrows the fleet by regex.
+worker: prometheus
+
+params:
+  instance:    {type: string, default: ".*", description: "Regex over the instance label, e.g. web-.* or db-0[1-3].*"}
+  at:          {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:       {type: string, default: "6h", description: "Look-back range ending at `at`, e.g. 2h, 1d", pattern: "^[0-9]+[smhdwy]$"}
+  step:        {type: string, default: "60s", description: "Sample resolution such as 30s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  sensitivity: {type: number, default: 3, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k: 1.5 = standard outliers, 3 = only extreme ones"}
+  direction:   {type: string, default: "both", enum: [both, up, down], description: "Which deviations to report"}
+  top:         {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many VMs to list, most anomalous first"}
+  min_delta:   {type: number, default: 5, minimum: 0, maximum: 100, description: "Ignore anomalies closer than this many percentage points to the VM's median: filters the noise of nearly idle VMs whose IQR is tiny"}
+
+request:
+  type: range
+  query: |
+    100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", job="node_exporters", instance=~{{ promLabel .instance }}}[5m])))
+      * on (instance) group_left (nodename) node_uname_info{job="node_exporters"}
+  # start = at - range: "now" and "now-<d>" stay relative, RFC3339 is shifted with sprig date functions.
+  start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+  end: "{{ .at }}"
+  step: "{{ .step }}"
+
+process:
+  - fn: anomaly
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      direction: "{{ .direction }}"
+      min_points: 30
+      min_delta: "{{ .min_delta }}"  # points from the median; drops the blips of nearly idle VMs before the cap
+      max_anomalies: 3               # the three strongest per VM, in time order
+
+response:
+  jq: |
+    [ .series[] | select(.skipped | not) | select(.anomaly_count > 0)
+      | {instance: .metric.instance, nodename: .metric.nodename, points, count: .anomaly_count,
+         median: .stats.median, lower: .stats.lower, upper: .stats.upper, max: .stats.max,
+         anomalies: (.anomalies | map({time, value, direction, score}))}
+    ] as $vms
+    | {
+      at: $params.at, range: $params.range,
+      vms_total: .series_total, vms_analyzed: .series_analyzed, vms_skipped: .series_skipped,
+      raw_total: (.total_anomalies + ([.series[].below_min_delta // 0] | add // 0)),
+      total: .total_anomalies,
+      vms_with_anomalies: ($vms | length),
+      vms: ($vms | sort_by(-.count, -.max) | .[:$params.top])
+    }
+  render: |
+    {{ if eq (int .total) 0 }}No CPU anomalies among {{ .vms_analyzed }} VM(s) matching {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }} (IQR k={{ param "sensitivity" }}, ignoring deviations under {{ param "min_delta" }} points; {{ .raw_total }} raw sample(s) were below that{{ if .vms_skipped }}; {{ .vms_skipped }} VM(s) skipped for lack of samples{{ end }}).{{ else }}
+    {{ .total }} anomalous CPU sample(s) on {{ .vms_with_anomalies }} of {{ .vms_analyzed }} VM(s) over the {{ param "range" }} ending at {{ .at }} (IQR k={{ param "sensitivity" }}, direction {{ param "direction" }}, deviations under {{ param "min_delta" }} points ignored: {{ .raw_total }} raw; {{ .vms_skipped }} skipped). Top {{ len .vms }}:
+    {{ range .vms }}{{ .nodename | default .instance }} ({{ .instance }}): {{ .count }} anomaly(ies), typical {{ printf "%.1f" (float64 .median) }}% busy, fences {{ printf "%.1f" (float64 .lower) }}..{{ printf "%.1f" (float64 .upper) }}%
+    {{ range .anomalies }}  - {{ .time }} {{ .direction }} to {{ printf "%.1f" (float64 .value) }}% (score {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}{{ end }}

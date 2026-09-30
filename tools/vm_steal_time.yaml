@@ -1,0 +1,57 @@
+name: vm_steal_time
+description: |
+  Virtual machines that had CPU steal time (CPU time taken by the hypervisor
+  for other guests) within the last `window`. Based on node_exporter
+  (node_cpu_seconds_total{mode="steal"}), steal is a percentage of the VM's
+  total CPU time, averaged across its vCPUs.
+  Returns only VMs whose peak steal exceeded `threshold` percent, sorted by
+  peak, highest first: instance, node name (from node_uname_info, null if
+  missing), peak %, average % over the whole window and roughly how many
+  minutes steal stayed above the threshold.
+  The kernel counts steal in 10ms ticks, so a single tick already shows up as
+  a few thousandths of a percent; keep `threshold` well above 0 unless you
+  really need every VM with any steal at all.
+  Use it to find noisy-neighbour / overcommitted hosts. For windows longer
+  than a day raise `step` (e.g. 5m) to keep the query cheap.
+worker: prometheus
+params:
+  window: {type: string, default: "1h", description: "Look-back window such as 30m, 6h, 1d", pattern: "^[0-9]+[smhdwy]$"}
+  threshold: {type: number, default: 1, description: "Minimum peak steal, percent of VM CPU time; 0 = any steal at all, including single-tick noise", minimum: 0, maximum: 100}
+  step: {type: string, default: "1m", description: "Resolution for peak and time-above-threshold such as 30s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+request:
+  type: instant
+  query: |
+    label_replace(
+      max_over_time((avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[{{ max 300 (promDurationSeconds .step) }}s])) * 100)[{{ promDuration .window }}:{{ promDuration .step }}]) > {{ .threshold }},
+      "stat", "peak", "", "")
+    or label_replace(
+      count_over_time((avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[{{ max 300 (promDurationSeconds .step) }}s])) * 100 > {{ .threshold }})[{{ promDuration .window }}:{{ promDuration .step }}]) * {{ promDurationSeconds .step }},
+      "stat", "seconds_above", "", "")
+    or label_replace(
+      avg by (instance) (rate(node_cpu_seconds_total{mode="steal"}[{{ promDuration .window }}])) * 100,
+      "stat", "avg", "", "")
+    or label_replace(
+      max by (instance, nodename) (last_over_time(node_uname_info[{{ promDuration .window }}])),
+      "stat", "info", "", "")
+  time: now-2d
+response:
+  jq: |
+    [ .result
+      | group_by(.metric.instance)[]
+      | (map(select(.metric.stat != "info") | {key: .metric.stat, value: (.value[1] | tonumber)}) | from_entries) as $s
+      | select($s.peak != null)
+      | {
+          instance: .[0].metric.instance,
+          node: (map(select(.metric.stat == "info") | .metric.nodename) | first),
+          peak_pct: $s.peak,
+          avg_pct: ($s.avg // 0),
+          minutes_above: (($s.seconds_above // 0) / 60)
+        }
+    ]
+    | sort_by(-.peak_pct)
+  render: |
+    {{- define "pct" }}{{ $v := float64 . }}{{ if and (gt $v 0.0) (lt $v 0.01) }}<0.01{{ else }}{{ printf "%.2f" $v }}{{ end }}%{{ end -}}
+    {{ if not . }}No VMs with CPU steal time above {{ param "threshold" }}% in the last {{ param "window" }}.{{ else }}
+    {{ len . }} VM(s) with CPU steal time above {{ param "threshold" }}% in the last {{ param "window" }}:
+    {{ range . }}- {{ if .node }}{{ .node }} ({{ .instance }}){{ else }}{{ .instance }}{{ end }}: peak {{ template "pct" .peak_pct }}, avg {{ template "pct" .avg_pct }}, above threshold ~{{ printf "%.0f" (float64 .minutes_above) }} min
+    {{ end }}{{ end }}

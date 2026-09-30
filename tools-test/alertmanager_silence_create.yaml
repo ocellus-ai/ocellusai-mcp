@@ -1,0 +1,42 @@
+# REST worker, action: POST with a JSON body rendered from parameters. For an
+# action the worker returns {status, headers, body}, so the agent sees the code.
+name: alertmanager_silence_create
+description: |
+  Create an Alertmanager silence that mutes alerts with the given alertname
+  (optionally only in one namespace) for a duration starting now.
+  This is an action: matching alerts stop notifying until the silence expires.
+  Returns {"id","status"}.
+worker: rest
+
+params:
+  alertname:  {type: string, required: true, description: "Exact alertname to silence"}
+  namespace:  {type: string, default: "", description: "Limit the silence to this namespace label (empty = any namespace)"}
+  duration:   {type: string, default: "2h", pattern: "^[0-9]+[mh]$", description: "How long the silence lasts, e.g. 30m or 2h"}
+  comment:    {type: string, required: true, description: "Why the alert is silenced (shown in Alertmanager)"}
+  created_by: {type: string, default: "ocellusai-mcp", description: "Author shown in Alertmanager"}
+
+request:
+  method: POST
+  path: /silences
+  # A string body is sent as is and must render to valid JSON. toJson quotes
+  # and escapes parameter values; numbers and booleans keep their type.
+  body: |
+    {{- $start := now -}}
+    {{- $end := $start | dateModify (printf "+%s" .duration) -}}
+    {
+      "matchers": [
+        {"name": "alertname", "value": {{ .alertname | toJson }}, "isRegex": false, "isEqual": true}
+        {{- if .namespace }},
+        {"name": "namespace", "value": {{ .namespace | toJson }}, "isRegex": false, "isEqual": true}
+        {{- end }}
+      ],
+      "startsAt": {{ dateInZone "2006-01-02T15:04:05Z07:00" $start "UTC" | toJson }},
+      "endsAt": {{ dateInZone "2006-01-02T15:04:05Z07:00" $end "UTC" | toJson }},
+      "createdBy": {{ .created_by | toJson }},
+      "comment": {{ .comment | toJson }}
+    }
+
+response:                          # . = {status, headers, body: {silenceID}}
+  jq: '{id: .body.silenceID, status: .status}'
+  render: |
+    Silence {{ .id }} created (HTTP {{ .status }}): {{ param "alertname" }}{{ with param "namespace" }} in namespace {{ . }}{{ end }} muted for {{ param "duration" }}.

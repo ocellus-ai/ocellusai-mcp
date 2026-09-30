@@ -1,0 +1,11 @@
+# Level 1: jq only. Output is still JSON, trimmed to what the agent needs.
+name: targets_down
+description: |
+  List of scrape targets that are currently down (up == 0).
+  Returns [{"job": "...", "instance": "..."}]; an empty list means all targets are up.
+worker: prometheus
+request:
+  type: instant
+  query: up == 0
+response:
+  jq: '[.result[] | {job: .metric.job, instance: .metric.instance}]'
