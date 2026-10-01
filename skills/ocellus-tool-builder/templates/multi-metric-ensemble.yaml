@@ -1,0 +1,120 @@
+# Template: calls (one range query per signal, identical start/end/step) → join →
+# anomaly_ensemble → level-2 answer with joint segments and single-signal segments,
+# both filtered by their effect at the peak in real units. CPU busy %, iowait %
+# and memory used % per host (node_exporter). Adapt: the signals (one call each,
+# one series per instance), the min_* parameters and their defaults.
+name: node_pressure_segments
+description: |
+  Anomalous time segments per host (node_exporter) over the `range` ending at
+  `at`, analysed jointly over CPU busy %, iowait % and memory used % by an
+  ensemble of detectors (shape changes, sudden jumps, levels reached slowly,
+  rare states, broken relations between the metrics). Thresholds adapt to
+  each host's own noise (`risk` = expected false positives per sample and
+  detector). A segment is reported only when at least one signal moved at its
+  peak by its minimum from the host's usual (median) level: `min_cpu`,
+  `min_iowait`, `min_mem` percentage points. Returns, per host with findings,
+  joint segments (start, end, peak, kind: single = one metric alone,
+  correlation = the relation broke, systemic = several metrics, and which
+  signals moved from what to what) and single-signal segments not covered by
+  a joint one. At the default `risk` a slowly reached plateau is flagged only
+  when it is far from the usual noise; raise `risk` to 0.01 to examine a known
+  moment more closely.
+params:
+  instance:   {type: string, default: ".*", description: "Regex over the instance label, e.g. db-.*"}
+  at:         {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:      {type: string, default: "1d", description: "Look-back range ending at `at`, e.g. 12h, 2d", pattern: "^[0-9]+[smhdwy]$"}
+  step:       {type: string, default: "60s", description: "Sample resolution such as 30s, 5m", pattern: "^[0-9]+[smhdwy]$"}
+  window:     {type: string, default: "1h", description: "Length of a shape to compare, e.g. 30m, 2h", pattern: "^[0-9]+[smhdwy]$"}
+  risk:       {type: number, default: 0.001, minimum: 0.000001, maximum: 0.1, description: "Expected false positives per sample and detector; lower is stricter, 0.01 to look closely around a known moment"}
+  min_cpu:    {type: number, default: 5, minimum: 0, maximum: 100, description: "Smallest meaningful CPU busy change, percentage points"}
+  min_iowait: {type: number, default: 1, minimum: 0, maximum: 100, description: "Smallest meaningful iowait change, percentage points"}
+  min_mem:    {type: number, default: 3, minimum: 0, maximum: 100, description: "Smallest meaningful memory use change, percentage points"}
+  top:        {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many hosts to list, most findings first"}
+
+calls:
+  - name: cpu
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", instance=~{{ promLabel .instance }}}[5m])))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: iowait
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        100 * avg by (instance) (rate(node_cpu_seconds_total{mode="iowait", instance=~{{ promLabel .instance }}}[5m]))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+  - name: mem
+    worker: prometheus
+    request:
+      type: range
+      query: |
+        # max by (instance): one series per instance even if its labels change inside the window
+        max by (instance) (100 * (1 - node_memory_MemAvailable_bytes{instance=~{{ promLabel .instance }}}
+                                    / node_memory_MemTotal_bytes{instance=~{{ promLabel .instance }}}))
+      start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+      end: "{{ .at }}"
+      step: "{{ .step }}"
+
+process:
+  - fn: join                          # {cpu, iowait, mem: matrix} → one (cpu, iowait, mem) series per instance
+    with:
+      inputs: [cpu, iowait, mem]
+      join_by: [instance]
+  - fn: anomaly_ensemble
+    with:
+      window: "{{ .window }}"
+      risk: "{{ .risk }}"
+      min_len: 2m                     # shorter segments are dropped
+      min_points: 120                 # at least two hours of 1m samples
+      max_ranges: 20
+      top_metrics: 3
+      min_delta: {cpu: "{{ .min_cpu }}", iowait: "{{ .min_iowait }}", mem: "{{ .min_mem }}"}   # a quarter is the detectors' noise floor
+      min_rel_delta: 0.2              # or a fifth of the usual level, if larger
+
+response:
+  jq: |
+    {cpu: $params.min_cpu, iowait: $params.min_iowait, mem: $params.min_mem} as $min
+    | [ .series[] | select(.skipped | not)
+        | ([ .anomalies[] | . as $a
+             | [ $min | keys[] | select($a.values[.] != null and $a.baseline[.] != null)
+                 | select((($a.values[.] - $a.baseline[.]) | fabs) >= $min[.]) ] as $moved
+             | select(($moved | length) > 0)
+             | {start, end, start_time, end_time, peak_time, kind, score,
+                moved: [ $moved[] | {signal: ., value: $a.values[.], usual: $a.baseline[.]} ]} ]) as $joint
+        | ([ .metrics | to_entries[] | .key as $dim | .value.anomalies[]? | . as $s
+             | select($s.value != null and $s.baseline != null)
+             | select((($s.value - $s.baseline) | fabs) >= $min[$dim])
+             | select(any($joint[]; .start <= $s.start and .end >= $s.end) | not)
+             | {signal: $dim, start_time, end_time, peak_time, score, value, usual: .baseline} ]
+           | sort_by(.start_time)) as $single
+        | select(($joint | length) + ($single | length) > 0)
+        | {instance: .labels.instance, max_score, joint: $joint, single: $single,
+           findings: (($joint | length) + ($single | length))}
+      ] as $hosts
+    | {
+        at: $params.at, range: $params.range,
+        analyzed: .series_analyzed, skipped_count: .series_skipped,
+        with_findings: ($hosts | length),
+        skipped: [ .series[] | select(.skipped) | {instance: .labels.instance, reason} ],
+        errors: [ .series[] | select(.skipped | not) | select(.error) | {instance: .labels.instance, error} ],
+        hosts: ($hosts | sort_by(-.findings, -(.max_score // 0)) | .[:$params.top])
+      }
+  render: |
+    {{- define "move" }}{{ .signal }} {{ printf "%.1f" (float64 .value) }}% (usually {{ printf "%.1f" (float64 .usual) }}){{ end -}}
+    {{ if eq (int .with_findings) 0 }}No significant anomalous segments among {{ .analyzed }} host(s) matching {{ param "instance" }} over the {{ param "range" }} ending at {{ .at }} (risk {{ param "risk" }}; minimum moves cpu {{ param "min_cpu" }}, iowait {{ param "min_iowait" }}, mem {{ param "min_mem" }} points; {{ .skipped_count }} host(s) skipped).{{ else -}}
+    Anomalous segments on {{ .with_findings }} of {{ .analyzed }} host(s) over the {{ param "range" }} ending at {{ .at }} (risk {{ param "risk" }}, window {{ param "window" }}; minimum moves cpu {{ param "min_cpu" }}, iowait {{ param "min_iowait" }}, mem {{ param "min_mem" }} points; {{ .skipped_count }} skipped). Top {{ len .hosts }}:
+    {{ range .hosts }}{{ .instance }}: {{ .findings }} segment(s)
+    {{ range .joint }}  - {{ .start_time }} .. {{ .end_time }} (joint, {{ .kind }}, score {{ printf "%.1f" (float64 .score) }}): {{ range $i, $m := .moved }}{{ if $i }}, {{ end }}{{ template "move" $m }}{{ end }}
+    {{ end }}{{ range .single }}  - {{ .start_time }} .. {{ .end_time }} ({{ .signal }} only, score {{ printf "%.1f" (float64 .score) }}): {{ template "move" . }}
+    {{ end }}{{ end }}{{ end }}
+    {{- if .errors }}
+    The joint analysis failed on: {{ range $i, $e := .errors }}{{ if $i }}, {{ end }}{{ $e.instance }} ({{ $e.error }}){{ end }}{{ end }}
+    {{- if .skipped }}
+    Skipped: {{ range $i, $s := .skipped }}{{ if $i }}, {{ end }}{{ $s.instance }} ({{ $s.reason }}){{ end }}{{ end }}

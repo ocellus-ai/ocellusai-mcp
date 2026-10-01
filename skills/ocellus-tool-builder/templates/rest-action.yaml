@@ -1,0 +1,33 @@
+# Template: rest worker, an ACTION (POST) on a second rest instance: path segments
+# through pathEscape and anchored patterns, no body, the default `result: full`
+# so the agent sees the HTTP status. Retries a GitLab pipeline. Needs a rest
+# instance with the GitLab API base URL and a token in the server config, e.g.
+#   workers:
+#     gitlab:
+#       type: rest
+#       url: https://gitlab.example.com/api/v4
+#       headers: {PRIVATE-TOKEN: "${GITLAB_TOKEN}"}
+#       methods: [GET, POST]
+# Adapt: the instance name, the path, the jq over the response.
+name: gitlab_pipeline_retry
+description: |
+  Retries the failed or canceled jobs of a GitLab pipeline (GitLab API v4).
+  This is an action: GitLab starts the jobs again, which may deploy or use
+  CI minutes; call it only when the user asked to retry this pipeline.
+  `project` is the numeric project id or the full path such as
+  group/subgroup/app; `pipeline_id` is the numeric pipeline id. Returns the
+  HTTP status and the pipeline's id, new status and web URL.
+worker: gitlab
+
+params:
+  project:     {type: string, required: true, description: "Project id or full path, e.g. 42 or platform/billing-api", pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]*$"}
+  pipeline_id: {type: integer, required: true, minimum: 1, description: "Pipeline id, e.g. 123456"}
+
+request:
+  method: POST
+  path: /projects/{{ pathEscape .project }}/pipelines/{{ .pipeline_id }}/retry
+
+response:                             # . = {status, headers, body}
+  jq: '{status: .status, id: .body.id, pipeline_status: .body.status, web_url: .body.web_url}'
+  render: |
+    Pipeline {{ .id }} of {{ param "project" }} retried (HTTP {{ .status }}): now {{ .pipeline_status }}{{ with .web_url }}, {{ . }}{{ end }}.

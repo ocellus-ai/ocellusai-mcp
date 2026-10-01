@@ -1,0 +1,82 @@
+# Template: one range query ending at `at` → ssa (trend, cycles, noise, forecast)
+# → level-2 answer that summarizes the forecast instead of listing points.
+# CPU busy % per host (node_exporter). Adapt: the metric, clip (percentages stay
+# in 0..100, rates only >= 0), min_delta in the metric's units, the defaults.
+# SSA needs at least three periods of the main cycle: 3+ days for a daily one.
+name: node_cpu_forecast
+description: |
+  Decomposes the CPU busy % of each host (node_exporter) over the `range`
+  ending at `at` into a trend, cycles (daily, its harmonics) and noise by
+  Singular Spectrum Analysis, and forecasts the structure `horizon` ahead.
+  Returns per host what the structure is (components with their periods),
+  how much of the movement it explains, the forecast summary (lowest and
+  highest value, when the peak comes, the value at the end), stretches in
+  another regime (an outage or catch-up of 2h or more: they distort the
+  trend, periods and forecast, so re-run with `at`/`range` outside them),
+  daily recurring stretches (scheduled jobs, not forecast) and warnings.
+  Hosts whose history is broken or whose forecast is flagged come last.
+  `window` should be a multiple of the main period (1d for a daily cycle) and
+  `range` at least three periods. The forecast is a smooth expectation
+  without noise or a confidence band.
+worker: prometheus
+
+params:
+  instance: {type: string, default: ".*", description: "Regex over the instance label, e.g. web-.*"}
+  at:       {type: string, default: "now", description: "End of the history: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  range:    {type: string, default: "7d", description: "History ending at `at`, at least three periods of the main cycle, e.g. 4d, 7d", pattern: "^[0-9]+[smhdwy]$"}
+  step:     {type: string, default: "5m", description: "Sample resolution such as 5m, 15m", pattern: "^[0-9]+[smhdwy]$"}
+  window:   {type: string, default: "1d", description: "SSA window, a multiple of the main period, e.g. 1d", pattern: "^[0-9]+[smhdwy]$"}
+  horizon:  {type: string, default: "1d", description: "How far ahead of the history to forecast, e.g. 12h, 2d", pattern: "^[0-9]+[smhdwy]$"}
+  top:      {type: integer, default: 10, minimum: 1, maximum: 200, description: "How many hosts to list, highest forecast peak first"}
+
+request:
+  type: range
+  query: |
+    100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", instance=~{{ promLabel .instance }}}[5m])))
+  start: '{{ if eq .at "now" }}now-{{ promDuration .range }}{{ else if hasPrefix "now-" .at }}now-{{ add (promDurationSeconds (trimPrefix "now-" .at)) (promDurationSeconds .range) }}s{{ else }}{{ (toDate "2006-01-02T15:04:05Z07:00" .at | dateModify (printf "-%ds" (promDurationSeconds .range))).Unix }}{{ end }}'
+  end: "{{ .at }}"
+  step: "{{ .step }}"
+
+process:
+  - fn: ssa
+    with:
+      window: "{{ .window }}"         # points or a duration, resolved at the series' step
+      forecast: "{{ .horizon }}"
+      clip: [0, 100]                  # a percentage: the level and the forecast stay in range
+      min_points: 288                 # at least a day of 5m samples
+      min_delta: 5                    # the smallest meaningful stretch away from the usual profile, points
+      min_rel_delta: 0.2              # or a fifth of the usual level, if larger
+
+response:
+  jq: |
+    {
+      at: $params.at, range: $params.range,
+      analyzed: .series_analyzed,
+      skipped: [ .series[] | select(.skipped) | {instance: .labels.instance, reason} ],
+      hosts: [ .series[] | select(.skipped | not)
+               | {instance: .labels.instance,
+                  structure: [ .components[] | select(.borderline | not) | "\(.group) \(.meaning)" ],
+                  explained: .residual.explained,
+                  broken: (.broken // false),
+                  regime: [ .runs[]? | select(.kind == "long") | {start_time, end_time, deviation} ],
+                  daily: [ .recurring[]? | {time_of_day, days, of_days, deviation} ],
+                  warnings: [ .findings[] | select(.level == "warn") | .text ],
+                  forecast: (.forecast | if .points then
+                               {end_time, warning: (.warning // null),
+                                low: (.points | map(.[1]) | min),
+                                peak: (.points | max_by(.[1]) | {value: .[1], time: (.[0] | todate)}),
+                                last: .points[-1][1]}
+                             else {reason: (.reason // "no forecast")} end)}
+               | .trust = (if .broken or (.forecast.warning != null) then 1 else 0 end) ]
+             | sort_by(.trust, -(.forecast.peak.value // -1)) | .[:$params.top]
+    }
+  render: |
+    {{ if not .hosts }}No host matching {{ param "instance" }} had enough history over the {{ param "range" }} ending at {{ .at }}{{ if .skipped }} ({{ len .skipped }} skipped: {{ range $i, $s := .skipped }}{{ if $i }}, {{ end }}{{ $s.instance }} ({{ $s.reason }}){{ end }}){{ end }}.{{ else -}}
+    CPU busy % forecast {{ param "horizon" }} ahead for {{ .analyzed }} host(s), history {{ param "range" }} ending at {{ .at }} (window {{ param "window" }}){{ if .skipped }}; {{ len .skipped }} skipped{{ end }}:
+    {{ range .hosts }}{{ .instance }}: {{ join "; " .structure }}; the structure explains {{ printf "%.0f" (mulf 100 (float64 .explained)) }}% of the movement.
+    {{ with .forecast }}{{ if hasKey . "reason" }}  forecast: {{ .reason }}{{ else }}  forecast to {{ .end_time }}: {{ printf "%.1f" (float64 .low) }}..{{ printf "%.1f" (float64 .peak.value) }}%, peak at {{ .peak.time }}, {{ printf "%.1f" (float64 .last) }}% at the end{{ if .warning }}
+      warning: {{ .warning }}{{ end }}{{ end }}{{ end }}
+    {{ range .regime }}  another regime {{ .start_time }} .. {{ .end_time }} ({{ if lt (float64 .deviation) 0.0 }}below{{ else }}above{{ end }} the usual profile by {{ printf "%.1f" (float64 .deviation) }}): re-run outside it
+    {{ end }}{{ range .daily }}  recurs daily at ~{{ .time_of_day }} UTC on {{ .days }}/{{ .of_days }} days (a scheduled job, not forecast)
+    {{ end }}{{ range .warnings }}  warning: {{ . }}
+    {{ end }}{{ end }}{{ end }}

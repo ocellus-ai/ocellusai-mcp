@@ -1,0 +1,63 @@
+# Template: one instant query → a jq step builds the canonical list
+# [{key, value, labels}] → outliers (each object against its peers, no time axis)
+# → level-2 answer. CPU busy % of hosts compared within each scrape job
+# (node_exporter). Adapt: the metric, the group labels, the unit of min_delta.
+name: node_cpu_outliers
+description: |
+  Hosts whose CPU busy % (node_exporter, averaged over `window` before `at`)
+  stands out from the other hosts of the same scrape job: IQR fences over the
+  hosts of each job, no fixed threshold. An outlier must also differ from the
+  job's median by at least `min_delta` percentage points. Returns, per job,
+  how many hosts were compared, the median and the outliers with host, busy
+  %, direction (up = busier than its peers) and score. Jobs with fewer than 5
+  hosts are skipped. Use it to spot the one host that works much harder (or
+  idles) compared with its peers right now; for a host against its own
+  history use an anomaly tool.
+worker: prometheus
+
+params:
+  instance:    {type: string, default: ".*", description: "Regex over the instance label, e.g. web-.*"}
+  at:          {type: string, default: "now", description: "Evaluation time: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+  window:      {type: string, default: "15m", description: "Averaging window before `at`, e.g. 5m, 1h", pattern: "^[0-9]+[smhdwy]$"}
+  sensitivity: {type: number, default: 1.5, minimum: 0.1, maximum: 10, description: "IQR fence multiplier k: 1.5 = standard outliers, 3 = only extreme ones"}
+  direction:   {type: string, default: "up", enum: [both, up, down], description: "up = busier than the peers, down = idler, both"}
+  min_delta:   {type: number, default: 10, minimum: 0, maximum: 100, description: "Smallest difference from the job's median worth reporting, percentage points of CPU"}
+
+request:
+  type: instant
+  time: "{{ .at }}"
+  query: |
+    100 * (1 - avg by (job, instance) (rate(node_cpu_seconds_total{mode="idle", instance=~{{ promLabel .instance }}}[{{ promDuration .window }}])))
+
+process:
+  - fn: jq
+    with:
+      expr: '[.result[] | {key: .metric.instance, value: .value[1], labels: {job: .metric.job}}]'
+  - fn: outliers
+    with:
+      method: iqr
+      k: "{{ .sensitivity }}"
+      group_by: [job]
+      direction: "{{ .direction }}"
+      min_points: 5
+      min_delta: "{{ .min_delta }}"   # percentage points from the median, applied before the cap
+      max_anomalies: 5
+
+response:
+  jq: |
+    {
+      at: $params.at,
+      groups_total: .series_total, groups_analyzed: .series_analyzed, groups_skipped: .series_skipped,
+      total: .total_anomalies,
+      below_min: ([.series[].below_min_delta // 0] | add // 0),
+      groups: [ .series[] | {job: .labels.job, hosts: .points, skipped, reason: (.reason // null),
+                            median: .stats.median, upper: .stats.upper, lower: .stats.lower,
+                            outliers: [.anomalies[] | {host: .key, busy_pct: .value, direction, score}]} ]
+              | sort_by(-(.outliers | length), -.hosts)
+    }
+  render: |
+    {{ if eq (int .groups_total) 0 }}No hosts matched {{ param "instance" }} at {{ .at }}.{{ else -}}
+    CPU outliers at {{ .at }} (busy % over {{ param "window" }}, IQR k={{ param "sensitivity" }}, direction {{ param "direction" }}, at least {{ param "min_delta" }} points from the job's median): {{ .total }} outlier(s) in {{ .groups_analyzed }} job(s){{ if .below_min }} ({{ .below_min }} closer to the median ignored){{ end }}, {{ .groups_skipped }} job(s) skipped.
+    {{ range .groups }}{{ .job }}: {{ .hosts }} host(s){{ if .skipped }}, skipped ({{ .reason }}){{ else }}, median {{ printf "%.1f" (float64 .median) }}%{{ if not .outliers }}, no outliers{{ end }}{{ end }}
+    {{ range .outliers }}  - {{ .host }}: {{ printf "%.1f" (float64 .busy_pct) }}% ({{ .direction }}, score {{ printf "%.1f" (float64 .score) }})
+    {{ end }}{{ end }}{{ end }}

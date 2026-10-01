@@ -1,0 +1,46 @@
+# Template: shell worker (a command from the instance allowlist, no shell, one
+# argument per args element) → jq → render. Pods that are not ready, via kubectl.
+# Adapt: the command and its arguments, the jq over its JSON output. The server's
+# shell instance needs kubectl in its allowlist and KUBECONFIG (or in-cluster
+# variables) in its env.
+name: pods_not_ready
+description: |
+  Pods of a Kubernetes namespace that are not ready (kubectl): pending,
+  failed, crash-looping or running with a container that is not ready.
+  Completed (Succeeded) pods are left out. Returns how many pods were checked
+  and, per problem pod, its phase, the waiting reason of a container (e.g.
+  CrashLoopBackOff, ImagePullBackOff), whether all containers are ready, the
+  restart count and the node, most restarts first. An empty list means every
+  checked pod is ready. `selector` narrows the pods by label selector.
+worker: shell
+
+params:
+  namespace: {type: string, required: true, description: "Kubernetes namespace, e.g. prod", pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+  selector:  {type: string, default: "", description: "Label selector such as app=api,tier!=db (empty = all pods)", pattern: "^([A-Za-z0-9._/][A-Za-z0-9._/=!,() -]*)?$"}
+
+request:
+  command: kubectl
+  # -l "" means no selector, so the optional parameter needs no conditional argument
+  args: [get, pods, -n, "{{ .namespace }}", -l, "{{ .selector }}", --field-selector=status.phase!=Succeeded, -o, json]
+  parse: json
+  timeout: 20s
+
+response:
+  jq: |
+    [ .items[]
+      | (.status.containerStatuses // []) as $cs
+      | {pod: .metadata.name,
+         phase: .status.phase,
+         ready: (($cs | length) > 0 and ($cs | all(.ready))),   # `all` of an empty list is true: a pending pod is not ready
+         waiting: ([$cs[] | .state.waiting.reason // empty] | first // null),
+         restarts: ([$cs[] | .restartCount] | add // 0),
+         node: (.spec.nodeName // null)} ] as $pods
+    | {
+        checked: ($pods | length),
+        not_ready: ([ $pods[] | select(.phase != "Running" or (.ready | not)) ] | sort_by(-.restarts))
+      }
+  render: |
+    {{ if not .not_ready }}All {{ .checked }} pod(s) in {{ param "namespace" }}{{ with param "selector" }} matching {{ . }}{{ end }} are ready.{{ else -}}
+    {{ len .not_ready }} of {{ .checked }} pod(s) in {{ param "namespace" }}{{ with param "selector" }} matching {{ . }}{{ end }} are not ready:
+    {{ range .not_ready }}- {{ .pod }}: {{ .phase }}{{ with .waiting }} ({{ . }}){{ end }}, {{ if .ready }}containers ready{{ else }}not ready{{ end }}, {{ .restarts }} restart(s), node {{ .node | default "-" }}
+    {{ end }}{{ end }}
