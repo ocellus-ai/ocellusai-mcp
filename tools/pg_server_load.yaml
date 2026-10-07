@@ -1,0 +1,193 @@
+# Load level of one PostgreSQL server from node_exporter (host) and
+# postgres_exporter (database): avg / p95 / max of every signal over a window
+# ending at `at`, a fixed-threshold level per signal (graded on p95, or p5 for
+# cache hit where lower is worse), an overall verdict and the bottlenecks.
+# Assumes both exporters are scraped with instance="<host>:<port>" (same host
+# name, different ports) and standard metric names; no job filter. Thresholds
+# live in the jq `$sig` table below: edit them there.
+name: pg_server_load
+description: |
+  How loaded one PostgreSQL server is over the `window` ending at `at`
+  (default: the last 1d), from node_exporter (host) and postgres_exporter
+  (database) in Prometheus. Every signal is reported as avg, p95 and max over
+  the window (for cache hit: avg, p5 and min, lower is worse) and graded on
+  p95/p5 against fixed thresholds: low / moderate / high / critical. Returns
+  the overall level (the worst signal), the bottlenecks (signals at high or
+  critical, grouped by resource: cpu, memory, disk, backends, transactions)
+  and every signal with its thresholds.
+
+  Host signals: cpu_busy_pct, cpu_iowait_pct, cpu_steal_pct, load1_per_core,
+  mem_used_pct, swap_out_pages_per_s, disk_util_pct (busiest device),
+  disk_await_ms, fs_used_max_pct (fullest filesystem); net_rx/tx_mbit_s are
+  informational (no level). Database signals: conn_used_pct (of
+  max_connections), active_per_core (active backends per CPU core),
+  idle_in_tx, oldest_tx_sec, cache_hit_pct, temp_mib_per_s; tps,
+  rows_read_per_s, rows_written_per_s are informational.
+
+  A signal with null values is not collected on that host and is left out of
+  the verdict; say so instead of guessing. found=false means neither exporter
+  matched the host name (check the name). Use it for "how loaded is pgXX",
+  "what is the bottleneck on pgXX", "was pgXX overloaded last night"
+  (at=now-12h, window=2h). For a comparison with last week use
+  pg_slowdown_check. Windows longer than 1d: raise `step` (15m+).
+worker: prometheus
+
+params:
+  host:   {type: string, description: "Host name as in the instance label, without port, e.g. pg-01 or pg-01.example.com (case-insensitive)", pattern: "^[a-zA-Z0-9._-]+$"}
+  window: {type: string, default: "1d", description: "Window to assess, ending at `at`, e.g. 1h, 6h, 1d, 7d", pattern: "^[0-9]+[smhdwy]$"}
+  step:   {type: string, default: "5m", description: "Resolution of p95 and max inside the window (rate window is max(5m, step))", pattern: "^[0-9]+[smhdwy]$"}
+  at:     {type: string, default: "now", description: "End of the window: now, now-<duration> such as now-3d, or an RFC3339 time", pattern: "^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$"}
+
+request:
+  type: instant
+  time: "{{ .at }}"
+  query: |
+    {{- if gt (div (promDurationSeconds .window) (promDurationSeconds .step)) 5000 }}{{ fail "window/step gives more than 5000 points: raise step" }}{{ end }}
+    {{- $h := promLabel (printf "(?i)%s(:[0-9]+)?" (promRegex .host)) }}
+    {{- $n := printf "instance=~%s" $h }}
+    {{- $d := printf `instance=~%s,device!~"loop.*|dm-.*|sr.*|ram.*|zram.*"` $h }}
+    {{- $f := printf `instance=~%s,fstype!~"tmpfs|devtmpfs|overlay|squashfs|ramfs|nsfs|fuse.*"` $h }}
+    {{- $net := printf `instance=~%s,device!~"lo|veth.*|docker.*|br-.*|cali.*|flannel.*|cni.*|virbr.*|vxlan.*|tun.*"` $h }}
+    {{- $w := promDuration .window }}{{ $s := promDuration .step }}
+    {{- $r := printf "%ds" (max 300 (promDurationSeconds .step)) }}
+    {{- $cores := printf `count(node_cpu_seconds_total{mode="idle",%s})` $n }}
+    {{- $sig := list
+        (dict "n" "cpu_busy_pct"         "lo" false "q" (printf `(1 - avg(rate(node_cpu_seconds_total{mode="idle",%s}[%s]))) * 100` $n $r))
+        (dict "n" "cpu_iowait_pct"       "lo" false "q" (printf `avg(rate(node_cpu_seconds_total{mode="iowait",%s}[%s])) * 100` $n $r))
+        (dict "n" "cpu_steal_pct"        "lo" false "q" (printf `avg(rate(node_cpu_seconds_total{mode="steal",%s}[%s])) * 100` $n $r))
+        (dict "n" "load1_per_core"       "lo" false "q" (printf `sum(node_load1{%s}) / %s` $n $cores))
+        (dict "n" "mem_used_pct"         "lo" false "q" (printf `(1 - sum(node_memory_MemAvailable_bytes{%s}) / (sum(node_memory_MemTotal_bytes{%s}) > 0)) * 100` $n $n))
+        (dict "n" "swap_out_pages_per_s" "lo" false "q" (printf `sum(rate(node_vmstat_pswpout{%s}[%s]))` $n $r))
+        (dict "n" "disk_util_pct"        "lo" false "q" (printf `max(rate(node_disk_io_time_seconds_total{%s}[%s])) * 100` $d $r))
+        (dict "n" "disk_await_ms"        "lo" false "q" (printf `sum(rate(node_disk_read_time_seconds_total{%s}[%s]) + rate(node_disk_write_time_seconds_total{%s}[%s])) / (sum(rate(node_disk_reads_completed_total{%s}[%s]) + rate(node_disk_writes_completed_total{%s}[%s])) > 0) * 1000` $d $r $d $r $d $r $d $r))
+        (dict "n" "fs_used_max_pct"      "lo" false "q" (printf `max(1 - node_filesystem_avail_bytes{%s} / (node_filesystem_size_bytes{%s} > 0)) * 100` $f $f))
+        (dict "n" "net_rx_mbit_s"        "lo" false "q" (printf `sum(rate(node_network_receive_bytes_total{%s}[%s])) * 8 / 1e6` $net $r))
+        (dict "n" "net_tx_mbit_s"        "lo" false "q" (printf `sum(rate(node_network_transmit_bytes_total{%s}[%s])) * 8 / 1e6` $net $r))
+        (dict "n" "conn_used_pct"        "lo" false "q" (printf `sum(pg_stat_activity_count{%s}) / (max(pg_settings_max_connections{%s}) > 0) * 100` $n $n))
+        (dict "n" "active_per_core"      "lo" false "q" (printf `sum(pg_stat_activity_count{state="active",%s}) / %s` $n $cores))
+        (dict "n" "idle_in_tx"           "lo" false "q" (printf `sum(pg_stat_activity_count{state=~"idle in transaction.*",%s})` $n))
+        (dict "n" "oldest_tx_sec"        "lo" false "q" (printf `max(pg_stat_activity_max_tx_duration{state!="idle",%s})` $n))
+        (dict "n" "cache_hit_pct"        "lo" true  "q" (printf `sum(rate(pg_stat_database_blks_hit{%s}[%s])) / (sum(rate(pg_stat_database_blks_hit{%s}[%s]) + rate(pg_stat_database_blks_read{%s}[%s])) > 0) * 100` $n $r $n $r $n $r))
+        (dict "n" "temp_mib_per_s"       "lo" false "q" (printf `sum(rate(pg_stat_database_temp_bytes{%s}[%s])) / 1048576` $n $r))
+        (dict "n" "tps"                  "lo" false "q" (printf `sum(rate(pg_stat_database_xact_commit{%s}[%s]) + rate(pg_stat_database_xact_rollback{%s}[%s]))` $n $r $n $r))
+        (dict "n" "rows_read_per_s"      "lo" false "q" (printf `sum(rate(pg_stat_database_tup_returned{%s}[%s]) + rate(pg_stat_database_tup_fetched{%s}[%s]))` $n $r $n $r))
+        (dict "n" "rows_written_per_s"   "lo" false "q" (printf `sum(rate(pg_stat_database_tup_inserted{%s}[%s]) + rate(pg_stat_database_tup_updated{%s}[%s]) + rate(pg_stat_database_tup_deleted{%s}[%s]))` $n $r $n $r $n $r))
+    }}
+    {{- range $i, $t := $sig }}{{ $sub := printf "(%s)[%s:%s]" $t.q $w $s }}{{ if $i }}
+    or {{ end }}label_replace(label_replace(avg_over_time({{ $sub }}), "stat", "{{ $t.n }}", "", ""), "agg", "avg", "", "")
+    or label_replace(label_replace(quantile_over_time({{ if $t.lo }}0.05{{ else }}0.95{{ end }}, {{ $sub }}), "stat", "{{ $t.n }}", "", ""), "agg", "level", "", "")
+    or label_replace(label_replace({{ if $t.lo }}min{{ else }}max{{ end }}_over_time({{ $sub }}), "stat", "{{ $t.n }}", "", ""), "agg", "peak", "", "")
+    {{- end }}
+    or label_replace(max(last_over_time(pg_up{ {{ $n }} }[{{ $w }}])), "stat", "pg_up", "", "")
+    or label_replace(max(last_over_time(pg_replication_is_replica{ {{ $n }} }[{{ $w }}])), "stat", "is_replica", "", "")
+    or label_replace(max by (short_version) (last_over_time(pg_static{ {{ $n }} }[{{ $w }}])), "stat", "version", "", "")
+    or label_replace(count(last_over_time(node_cpu_seconds_total{mode="idle",{{ $n }} }[{{ $w }}])), "stat", "cpu_cores", "", "")
+    or label_replace(max(last_over_time(node_memory_MemTotal_bytes{ {{ $n }} }[{{ $w }}])), "stat", "mem_total_bytes", "", "")
+
+response:
+  jq: |
+    # name, group, resource, unit, thresholds [moderate, high, critical] (null = informational), lower_is_worse
+    def sigs: [
+      ["cpu_busy_pct",         "host", "cpu",          "%",       [50, 80, 95],     false],
+      ["cpu_iowait_pct",       "host", "disk",         "%",       [5, 10, 25],      false],
+      ["cpu_steal_pct",        "host", "cpu",          "%",       [2, 5, 15],       false],
+      ["load1_per_core",       "host", "cpu",          "",        [0.7, 1, 2],      false],
+      ["mem_used_pct",         "host", "memory",       "%",       [70, 85, 95],     false],
+      ["swap_out_pages_per_s", "host", "memory",       "pages/s", [1, 50, 500],     false],
+      ["disk_util_pct",        "host", "disk",         "%",       [50, 80, 95],     false],
+      ["disk_await_ms",        "host", "disk",         "ms",      [5, 20, 100],     false],
+      ["fs_used_max_pct",      "host", "disk",         "%",       [70, 85, 95],     false],
+      ["net_rx_mbit_s",        "host", "network",      "Mbit/s",  null,             false],
+      ["net_tx_mbit_s",        "host", "network",      "Mbit/s",  null,             false],
+      ["conn_used_pct",        "db",   "backends",     "%",       [50, 80, 95],     false],
+      ["active_per_core",      "db",   "backends",     "",        [0.5, 1, 2],      false],
+      ["idle_in_tx",           "db",   "transactions", "",        [1, 5, 20],       false],
+      ["oldest_tx_sec",        "db",   "transactions", "s",       [60, 300, 1800],  false],
+      ["cache_hit_pct",        "db",   "memory",       "%",       [99, 95, 90],     true],
+      ["temp_mib_per_s",       "db",   "disk",         "MiB/s",   [1, 10, 100],     false],
+      ["tps",                  "db",   "load",         "tx/s",    null,             false],
+      ["rows_read_per_s",      "db",   "load",         "rows/s",  null,             false],
+      ["rows_written_per_s",   "db",   "load",         "rows/s",  null,             false]
+    ];
+    def rank: if . == null then -1 else ({"low": 0, "moderate": 1, "high": 2, "critical": 3}[.] // -1) end;
+    def grade($v; $t; $lo):
+      if $v == null or $t == null then null
+      elif $lo then (if $v < $t[2] then "critical" elif $v < $t[1] then "high" elif $v < $t[0] then "moderate" else "low" end)
+      else (if $v >= $t[2] then "critical" elif $v >= $t[1] then "high" elif $v >= $t[0] then "moderate" else "low" end)
+      end;
+    (.result | map(select(.metric.stat != null))) as $rows
+    | ($rows | map(select(.metric.agg != null))
+       | group_by(.metric.stat)
+       | map({key: .[0].metric.stat,
+              value: (map({key: .metric.agg, value: (.value[1] | tonumber? // null)}) | from_entries)})
+       | from_entries) as $v
+    | def info($s): $rows | map(select(.metric.stat == $s and .metric.agg == null)) | first;
+      def infonum($s): info($s) | if . == null then null else (.value[1] | tonumber? // null) end;
+    [ sigs[] | . as [$name, $grp, $res, $unit, $th, $lo]
+      | ($v[$name] // {}) as $x
+      | {
+          name: $name, group: $grp, resource: $res, unit: $unit,
+          avg: $x.avg, level_value: $x.level, peak: $x.peak,
+          level_stat: (if $lo then "p5" else "p95" end),
+          peak_stat: (if $lo then "min" else "max" end),
+          lower_is_worse: $lo, thresholds: $th,
+          level: grade($x.level; $th; $lo)
+        }
+      | .threshold_hit = (if .level == null or .level == "low" then null
+                          else .thresholds[(.level | rank) - 1] end)
+    ] as $signals
+    | ($signals | map(select(.avg != null))) as $present
+    | ($signals | map(select(.level != null)) | max_by(.level | rank) | .level // null) as $overall
+    | (infonum("is_replica")) as $rep
+    | {
+        host: $params.host, at: $params.at, window: $params.window, step: $params.step,
+        found: (($present | length) > 0 or info("pg_up") != null or info("cpu_cores") != null),
+        node_exporter: (info("cpu_cores") != null),
+        postgres_exporter: (info("pg_up") != null),
+        pg_up: infonum("pg_up"),
+        role: (if $rep == null then null elif $rep == 1 then "replica" else "primary" end),
+        version: (info("version") | if . == null then null else .metric.short_version end),
+        cpu_cores: infonum("cpu_cores"),
+        mem_total_bytes: infonum("mem_total_bytes"),
+        overall: $overall,
+        bottlenecks: (
+          $signals | map(select((.level | rank) >= 2))
+          | group_by(.resource)
+          | map({resource: .[0].resource,
+                 level: (max_by(.level | rank) | .level),
+                 signals: map({name, level, level_stat, level_value, threshold_hit, unit})})
+          | sort_by(-(.level | rank))
+        ),
+        missing: ($signals | map(select(.avg == null) | .name)),
+        signals: $present
+      }
+  render: |-
+    {{- define "v" }}{{ if kindIs "invalid" .v }}n/a{{ else }}{{ $x := float64 .v }}{{ if and (gt $x 0.0) (lt $x 0.01) }}<0.01{{ else if ge $x 1000.0 }}{{ printf "%.0f" $x }}{{ else if eq .u "%" }}{{ printf "%.1f" $x }}{{ else }}{{ printf "%.2f" $x }}{{ end }}{{ if eq .u "%" }}%{{ else if .u }} {{ .u }}{{ end }}{{ end }}{{ end }}
+    {{- define "bytes" }}{{ if kindIs "invalid" . }}n/a{{ else }}{{ printf "%.1f GiB" (divf (float64 .) 1073741824.0) }}{{ end }}{{ end -}}
+    {{ if not .found -}}
+    No node_exporter or postgres_exporter data for host {{ .host }} in the {{ .window }} window ending {{ .at }}. Check the host name (instance label without port).
+    {{- else -}}
+    {{ .host }}{{ if .role }} ({{ .role }}{{ if .version }}, PG {{ .version }}{{ end }}){{ end }}, {{ if kindIs "invalid" .cpu_cores }}cores n/a{{ else }}{{ printf "%.0f" (float64 .cpu_cores) }} cores{{ end }}, RAM {{ template "bytes" .mem_total_bytes }}
+    Load over the {{ .window }} window ending {{ .at }} (graded on p95; cache hit on p5): {{ if .overall }}{{ upper .overall }}{{ else }}UNKNOWN (no graded signals){{ end }}
+    {{- if not .node_exporter }}
+    WARNING: no node_exporter data for this host — host signals missing, the verdict covers the database only.{{ end }}
+    {{- if not .postgres_exporter }}
+    WARNING: no postgres_exporter data for this host — database signals missing, the verdict covers the host only.{{ end }}
+    {{- if and (not (kindIs "invalid" .pg_up)) (eq (float64 .pg_up) 0.0) }}
+    WARNING: pg_up=0 at the end of the window — the exporter cannot reach PostgreSQL, database numbers are stale.{{ end }}
+    {{- if .bottlenecks }}
+    Bottlenecks:
+    {{- range .bottlenecks }}
+    - {{ .resource }} ({{ .level }}): {{ range $i, $s := .signals }}{{ if $i }}; {{ end }}{{ $s.name }} {{ $s.level_stat }} {{ template "v" (dict "v" $s.level_value "u" $s.unit) }} (threshold {{ template "v" (dict "v" $s.threshold_hit "u" $s.unit) }}){{ end }}
+    {{- end }}
+    {{- else if .overall }}
+    Bottlenecks: none (no signal at high or critical).{{ end }}
+    {{ range $g := list "host" "db" }}
+    [{{ $g }}]
+    {{- range $.signals }}{{ if eq .group $g }}
+    - {{ .name }}: avg {{ template "v" (dict "v" .avg "u" .unit) }}, {{ .level_stat }} {{ template "v" (dict "v" .level_value "u" .unit) }}, {{ .peak_stat }} {{ template "v" (dict "v" .peak "u" .unit) }} — {{ if .level }}{{ .level }} (thresholds {{ range $i, $t := .thresholds }}{{ if $i }}/{{ end }}{{ $t }}{{ end }}{{ if .lower_is_worse }}, lower is worse{{ end }}){{ else }}info{{ end }}
+    {{- end }}{{ end }}
+    {{ end }}
+    {{- if .missing }}
+    Not collected on this host: {{ join ", " .missing }}.{{ end }}
+    {{- end }}
