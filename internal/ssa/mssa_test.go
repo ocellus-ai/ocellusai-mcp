@@ -154,7 +154,10 @@ func TestExponentialForecast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Sigma[1] > 1e-8*s.Sigma[0] {
+	// Sigma comes from the eigenvalues of X·Xᵀ, so a zero singular value is
+	// only resolved to about sqrt(eps)·sigma0 ≈ 1.5e-8·sigma0, and the exact
+	// noise depends on the platform's rounding (amd64 vs arm64 with FMA).
+	if s.Sigma[1] > 1e-6*s.Sigma[0] {
 		t.Fatalf("geometric series is not rank 1: sigma1/sigma0 = %.3g", s.Sigma[1]/s.Sigma[0])
 	}
 	for _, name := range []string{"L", "K"} {
