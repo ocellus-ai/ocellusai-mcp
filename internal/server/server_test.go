@@ -20,6 +20,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/ocellus-ai/ocellusai-mcp/internal/catalog"
+	"github.com/ocellus-ai/ocellusai-mcp/internal/config"
 	"github.com/ocellus-ai/ocellusai-mcp/internal/pipeline"
 	"github.com/ocellus-ai/ocellusai-mcp/internal/processor"
 	"github.com/ocellus-ai/ocellusai-mcp/internal/processor/anomaly"
@@ -61,7 +62,13 @@ func (m *promMock) handler() http.Handler {
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[
 			 {"metric":{"instance":"10.0.0.7:9100","job":"node"},"value":[1757600000,"0"]},
 			 {"metric":{"instance":"10.0.0.9:9100","job":"node"},"value":[1757600000,"0"]}]}}`))
-		case strings.HasPrefix(q, "topk("), strings.Contains(q, `pod=~"api-1|api-2"`):
+		case strings.HasPrefix(q, "up{instance=~"):
+			// dns_targets_up: two targets on 10.0.0.1, a down one on 10.0.0.7.
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[
+			 {"metric":{"instance":"10.0.0.1:9100","job":"node"},"value":[1757600000,"1"]},
+			 {"metric":{"instance":"10.0.0.1:9113","job":"nginx"},"value":[1757600000,"1"]},
+			 {"metric":{"instance":"10.0.0.7:9100","job":"node"},"value":[1757600000,"0"]}]}}`))
+		case strings.HasPrefix(q, "topk("):
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[
 			 {"metric":{"pod":"api-1"},"value":[1757600000,"0.25"]},
 			 {"metric":{"pod":"api-2"},"value":[1757600000,"1"]}]}}`))
@@ -126,20 +133,26 @@ func anomalyMatrix() string {
 }
 
 // amMock answers the Alertmanager API v2 endpoints used by the alertmanager_*
-// reference tools and records the last request it received.
+// reference tools and records the last request it received. With a token set,
+// every request must carry "Authorization: Bearer <token>", otherwise it gets
+// 401 like an Alertmanager behind an authenticating proxy.
 type amMock struct {
-	mu   sync.Mutex
-	last amRequest
+	mu    sync.Mutex
+	last  amRequest
+	token string
 }
 
 type amRequest struct {
-	Method, Path, Query, Body string
+	Method, Path, Query, Body, Auth string
 }
+
+// amToken is the bearer token referenceWorkers configures on both sides.
+const amToken = "am-s3cret"
 
 func (m *amMock) record(r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	m.mu.Lock()
-	m.last = amRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Body: string(body)}
+	m.last = amRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Body: string(body), Auth: r.Header.Get("Authorization")}
 	m.mu.Unlock()
 }
 
@@ -188,7 +201,19 @@ func (m *amMock) handler() http.Handler {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":"silence ` + r.PathValue("id") + ` not found"}`))
 	})
-	return mux
+	if m.token == "" {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+m.token {
+			m.record(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // referenceProcessors holds every processor the catalogs in ../../tools-test
@@ -234,19 +259,18 @@ func connect(t *testing.T, toolsDir string, workers worker.Registry, processors 
 	return cs
 }
 
-// fakeKubectl puts a `kubectl` script first on PATH that prints a fixed pod
-// list and records its arguments in <dir>/args. It must run before the shell
-// worker is created, which captures PATH for its children.
-func fakeKubectl(t *testing.T) string {
+// fakeDig puts a `dig` script first on PATH that prints a fixed answer for
+// `dig +short A <name>` (a CNAME, three addresses and a duplicate) and records
+// its arguments in <dir>/args. It must run before the shell worker is
+// created, which captures PATH for its children.
+func fakeDig(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	script := `#!/bin/sh
 printf '%s\n' "$*" > "${0%/*}/args"
-printf '%s' '{"kind":"List","items":[
- {"metadata":{"name":"api-1"},"spec":{"nodeName":"n1"},"status":{"phase":"Running","containerStatuses":[{"restartCount":2},{"restartCount":1}]}},
- {"metadata":{"name":"api-2"},"spec":{"nodeName":"n2"},"status":{"phase":"Running","containerStatuses":[{"restartCount":0}]}}]}'
+printf '%s\n' lb.example.internal. 10.0.0.7 10.0.0.1 10.0.0.20 10.0.0.1
 `
-	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil { //nolint:gosec // test script must be executable
+	if err := os.WriteFile(filepath.Join(dir, "dig"), []byte(script), 0o755); err != nil { //nolint:gosec // test script must be executable
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -262,14 +286,15 @@ func referenceWorkers(t *testing.T) (worker.Registry, *promMock, *amMock) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sw, err := shell.New(shell.Config{Allowlist: []string{"kubectl", "helm", "df"}, Timeout: 5 * time.Second})
+	sw, err := shell.New(shell.Config{Allowlist: []string{"dig", "df"}, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	am := &amMock{}
+	am := &amMock{token: amToken}
 	as := httptest.NewServer(am.handler())
 	t.Cleanup(as.Close)
-	rw, err := rest.New(rest.Config{URL: as.URL + "/api/v2", Timeout: 2 * time.Second})
+	rw, err := rest.New(rest.Config{URL: as.URL + "/api/v2", Timeout: 2 * time.Second,
+		Headers: map[string]string{"Authorization": "Bearer " + amToken}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +348,7 @@ func TestReferenceCatalogListTools(t *testing.T) {
 	for _, tl := range res.Tools {
 		byName[tl.Name] = tl
 	}
-	for _, want := range []string{"targets_up", "targets_down", "targets_down_summary", "pod_cpu_usage", "pods_status", "disk_usage", "namespace_cpu_timeseries", "pod_cpu_anomalies", "pods_cpu_status", "alertmanager_silences", "alertmanager_silence_create", "alertmanager_silence_expire", "pod_cpu_outliers", "disk_usage_outliers"} {
+	for _, want := range []string{"targets_up", "targets_down", "targets_down_summary", "pod_cpu_usage", "disk_usage", "namespace_cpu_timeseries", "pod_cpu_anomalies", "dns_targets_up", "alertmanager_silences", "alertmanager_silence_create", "alertmanager_silence_expire", "pod_cpu_outliers", "disk_usage_outliers"} {
 		if byName[want] == nil {
 			t.Errorf("tool %s missing from ListTools", want)
 		}
@@ -358,7 +383,7 @@ func TestWorkingCatalogLoads(t *testing.T) {
 }
 
 func TestReferenceCatalogCallTools(t *testing.T) {
-	kubeDir := fakeKubectl(t)
+	digDir := fakeDig(t)
 	workers, m, am := referenceWorkers(t)
 	cs := connect(t, "../../tools-test", workers, referenceProcessors())
 
@@ -481,37 +506,38 @@ func TestReferenceCatalogCallTools(t *testing.T) {
 		}
 	})
 
-	t.Run("calls pods_cpu_status joins kubectl and prometheus", func(t *testing.T) {
-		res := call(t, cs, "pods_cpu_status", map[string]any{"namespace": "prod", "selector": "app=api"})
+	t.Run("calls dns_targets_up joins dig and prometheus", func(t *testing.T) {
+		res := call(t, cs, "dns_targets_up", map[string]any{"name": "lb.example.internal"})
 		if res.IsError {
 			t.Fatalf("unexpected error: %s", text(t, res))
 		}
-		// First call: kubectl saw the rendered parameters.
-		args, err := os.ReadFile(filepath.Join(kubeDir, "args"))
-		if err != nil || strings.TrimSpace(string(args)) != "get pods -n prod -l app=api -o json" {
-			t.Errorf("kubectl args = %q, err = %v", args, err)
+		// First call: dig saw the rendered parameters.
+		args, err := os.ReadFile(filepath.Join(digDir, "args"))
+		if err != nil || strings.TrimSpace(string(args)) != "+short A lb.example.internal" {
+			t.Errorf("dig args = %q, err = %v", args, err)
 		}
-		// Second call: the query was built from the first call's result.
-		q := m.lastQuery()
-		for _, want := range []string{`namespace="prod"`, `pod=~"api-1|api-2"`, "[5m]"} {
-			if !strings.Contains(q, want) {
-				t.Errorf("rendered query %q lacks %q", q, want)
-			}
+		// Second call: the query was built from the addresses of the first.
+		if q, want := strings.TrimSpace(m.lastQuery()), `up{instance=~"(10\\.0\\.0\\.1|10\\.0\\.0\\.20|10\\.0\\.0\\.7)(:[0-9]+)?"}`; q != want {
+			t.Errorf("rendered query = %q, want %q", q, want)
 		}
-		// response.jq joined both by pod name, sorted by cores.
+		// response.jq joined both by address.
 		rows := wrapped(t, res).([]any)
-		if len(rows) != 2 {
+		if len(rows) != 3 {
 			t.Fatalf("structuredContent = %#v", res.StructuredContent)
 		}
-		first, second := rows[0].(map[string]any), rows[1].(map[string]any)
-		if first["pod"] != "api-2" || first["cores"] != float64(1) || first["restarts"] != float64(0) || first["node"] != "n2" {
-			t.Errorf("first row = %#v", first)
+		statuses := map[string]any{}
+		for _, r := range rows {
+			row := r.(map[string]any)
+			statuses[row["address"].(string)] = row["status"]
 		}
-		if second["pod"] != "api-1" || second["cores"] != 0.25 || second["restarts"] != float64(3) || second["phase"] != "Running" {
-			t.Errorf("second row = %#v", second)
+		if want := map[string]any{"10.0.0.1": "up", "10.0.0.20": "not scraped", "10.0.0.7": "down"}; !reflect.DeepEqual(statuses, want) {
+			t.Errorf("statuses = %#v", statuses)
+		}
+		if targets := rows[0].(map[string]any)["targets"].([]any); len(targets) != 2 || targets[1].(map[string]any)["job"] != "nginx" {
+			t.Errorf("targets of 10.0.0.1 = %#v", targets)
 		}
 		got := text(t, res)
-		for _, want := range []string{"2 pod(s) in prod matching app=api, CPU over the last 5m", "api-2: Running, 0 restart(s), node n2, 1.000 cores", "api-1: Running, 3 restart(s), node n1, 0.250 cores"} {
+		for _, want := range []string{"lb.example.internal resolves to 3 address(es):", "10.0.0.1: up; node on 10.0.0.1:9100 up; nginx on 10.0.0.1:9113 up", "10.0.0.20: not scraped", "10.0.0.7: down; node on 10.0.0.7:9100 down"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("text %q lacks %q", got, want)
 			}
@@ -524,7 +550,7 @@ func TestReferenceCatalogCallTools(t *testing.T) {
 			t.Fatalf("unexpected error: %s", text(t, res))
 		}
 		req := am.lastRequest()
-		if req.Method != "GET" || req.Path != "/api/v2/silences" || req.Query != "filter=alertname%3D%22HighCPU%22" {
+		if req.Method != "GET" || req.Path != "/api/v2/silences" || req.Query != "filter=alertname%3D%22HighCPU%22" || req.Auth != "Bearer "+amToken {
 			t.Errorf("request = %+v", req)
 		}
 		rows := wrapped(t, res).([]any)
@@ -728,6 +754,69 @@ func TestReferenceCatalogCallTools(t *testing.T) {
 			t.Errorf("text = %q", got)
 		}
 	})
+}
+
+// TestRestInstanceToken follows a bearer token from ${AM_TOKEN} in the config
+// through the rest instance to the Alertmanager mock, and checks that a wrong
+// or missing token is a worker-stage error that does not echo the secret.
+func TestRestInstanceToken(t *testing.T) {
+	const secret = "env-t0ken"
+	t.Setenv("AM_TOKEN", secret)
+	am := &amMock{token: secret}
+	as := httptest.NewServer(am.handler())
+	t.Cleanup(as.Close)
+
+	// instance builds a rest worker from a config entry, as main.go does.
+	instance := func(t *testing.T, headers string) worker.Worker {
+		t.Helper()
+		cfg, err := config.Parse([]byte("workers:\n  rest:\n    url: " + as.URL + "/api/v2\n" + headers))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc := cfg.Workers["rest"].Rest
+		rw, err := rest.New(rest.Config{URL: rc.URL, Timeout: rc.Timeout, Headers: rc.Headers, MaxResponseBytes: rc.MaxResponseBytes, Methods: rc.Methods})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rw
+	}
+	session := func(t *testing.T, rw worker.Worker) *mcp.ClientSession {
+		t.Helper()
+		workers, _, _ := referenceWorkers(t)
+		workers[rest.Type] = rw
+		return connect(t, "../../tools-test", workers, referenceProcessors())
+	}
+
+	t.Run("token from the environment is sent", func(t *testing.T) {
+		cs := session(t, instance(t, "    headers: {Authorization: \"Bearer ${AM_TOKEN}\"}\n"))
+		res := call(t, cs, "alertmanager_silences", map[string]any{"state": "all"})
+		if res.IsError {
+			t.Fatalf("unexpected error: %s", text(t, res))
+		}
+		if got := am.lastRequest().Auth; got != "Bearer "+secret {
+			t.Errorf("Authorization = %q", got)
+		}
+		if rows := wrapped(t, res).([]any); len(rows) != 2 {
+			t.Errorf("silences = %#v", rows)
+		}
+	})
+
+	for name, headers := range map[string]string{
+		"no token":    "",
+		"wrong token": "    headers: {Authorization: \"Bearer nope-${AM_TOKEN}\"}\n",
+	} {
+		t.Run(name+" is rejected", func(t *testing.T) {
+			cs := session(t, instance(t, headers))
+			res := call(t, cs, "alertmanager_silences", nil)
+			got := text(t, res)
+			if !res.IsError || !strings.Contains(got, `failed at stage worker: GET /api/v2/silences: 401 Unauthorized: {"error":"unauthorized"}`) {
+				t.Errorf("IsError = %v text = %q", res.IsError, got)
+			}
+			if strings.Contains(got, secret) {
+				t.Errorf("error text leaks the token: %q", got)
+			}
+		})
+	}
 }
 
 func TestShellLevels(t *testing.T) {

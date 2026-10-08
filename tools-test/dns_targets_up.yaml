@@ -1,0 +1,60 @@
+# calls: example — two sequential worker calls joined in jq. The first call
+# resolves a DNS name with dig and keeps the IPv4 addresses with a per-call
+# jq; the second builds a PromQL query for exactly those addresses through
+# `result "addrs"`; response.jq receives {addrs: ..., up: ...} and joins both
+# by address.
+name: dns_targets_up
+description: |
+  Resolves a DNS name and shows, for every IPv4 address behind it, which
+  Prometheus scrape targets run on that address and whether they are up.
+  An address without targets is reported as "not scraped". Use it to check
+  what stands behind a service name and whether monitoring sees all of it.
+  Returns [{"address","status","targets":[{"job","instance","up"}]}], where
+  status is up, partly down, down or not scraped.
+
+params:
+  # The pattern admits host names only, so the value can never become a dig
+  # option such as -f <file> or @<server>.
+  name: {type: string, required: true, pattern: "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\\.?$", description: "DNS name such as api.example.internal"}
+
+calls:
+  - name: addrs
+    worker: shell
+    request:
+      command: dig
+      args: [+short, A, "{{ .name }}"]
+      parse: lines
+      timeout: 10s
+    # dig +short also prints the CNAME chain; keep the addresses only.
+    jq: '[.[] | select(test("^[0-9]+(\\.[0-9]+){3}$"))] | unique'
+  - name: up
+    worker: prometheus
+    request:
+      type: instant
+      # The addresses become one anchored regex with an optional port; an
+      # empty list matches nothing instead of every target. promRegex escapes
+      # the dots, promLabel quotes the whole value for PromQL.
+      query: |
+        {{- $addrs := list }}{{ range result "addrs" }}{{ $addrs = append $addrs (promRegex .) }}{{ end -}}
+        up{instance=~{{ promLabel (printf "(%s)(:[0-9]+)?" (join "|" $addrs | default "__none__")) }}}
+
+response:
+  jq: |
+    [.up.result[] | {
+      address: (.metric.instance | sub(":[0-9]+$"; "")),
+      job: .metric.job,
+      instance: .metric.instance,
+      up: (.value[1] == "1")
+    }] as $targets
+    | [.addrs[] as $a
+        | [$targets[] | select(.address == $a) | {job, instance, up}] as $t
+        | {address: $a, targets: $t, status: (
+            if ($t | length) == 0 then "not scraped"
+            elif all($t[]; .up) then "up"
+            elif any($t[]; .up) then "partly down"
+            else "down" end)}]
+  render: |
+    {{ if not . }}{{ param "name" }} does not resolve to an IPv4 address.{{ else -}}
+    {{ param "name" }} resolves to {{ len . }} address(es):
+    {{ range . }}{{ .address }}: {{ .status }}{{ range .targets }}; {{ .job }} on {{ .instance }} {{ if .up }}up{{ else }}down{{ end }}{{ end }}
+    {{ end }}{{ end }}

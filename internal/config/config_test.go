@@ -34,9 +34,9 @@ workers:
     headers:
       Authorization: "Bearer ${PROM_TOKEN}"
   shell:
-    allowlist: [kubectl]
+    allowlist: [dig]
     max_output_bytes: ${MAXOUT}
-    env: {KUBECONFIG: /kube/config}
+    env: {LC_ALL: C}
 log:
   level: debug
   format: text
@@ -67,7 +67,7 @@ log:
 	if sh.Shell.Timeout != 30*time.Second {
 		t.Errorf("shell timeout default = %s", sh.Shell.Timeout)
 	}
-	if sh.Shell.Env["KUBECONFIG"] != "/kube/config" || cfg.Log.Level != "debug" {
+	if sh.Shell.Env["LC_ALL"] != "C" || cfg.Log.Level != "debug" {
 		t.Errorf("unexpected: %+v", cfg)
 	}
 	if got := strings.Join(cfg.Workers.Names(), ","); got != "prometheus,shell" {
@@ -84,15 +84,15 @@ workers:
     type: prometheus
     url: http://staging:9090
     timeout: 5s
-  kubectl:
+  dns:
     type: shell
-    allowlist: [kubectl]
+    allowlist: [dig]
   disabled:
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(cfg.Workers.Names(), ","); got != "kubectl,prom_staging,prometheus" {
+	if got := strings.Join(cfg.Workers.Names(), ","); got != "dns,prom_staging,prometheus" {
 		t.Errorf("names = %q (nil entries must be skipped)", got)
 	}
 	if inst, ok := cfg.Workers["disabled"]; !ok || inst != nil {
@@ -105,9 +105,9 @@ workers:
 	if cfg.Workers["prometheus"].Prometheus.URL != "http://prom:9090" {
 		t.Errorf("shorthand instance broken: %+v", cfg.Workers["prometheus"])
 	}
-	kc := cfg.Workers["kubectl"]
-	if kc.Type != WorkerShell || kc.Shell == nil || kc.Shell.Allowlist[0] != "kubectl" || kc.Shell.Timeout != 30*time.Second {
-		t.Errorf("kubectl = %+v", kc)
+	kc := cfg.Workers["dns"]
+	if kc.Type != WorkerShell || kc.Shell == nil || kc.Shell.Allowlist[0] != "dig" || kc.Shell.Timeout != 30*time.Second {
+		t.Errorf("dns = %+v", kc)
 	}
 }
 
@@ -154,7 +154,7 @@ func TestWorkerErrors(t *testing.T) {
 		"bad value type":            {"workers:\n  prometheus:\n    url: http://p\n    timeout: soon\n", "workers.prometheus:"},
 		"prom no url":               {"workers:\n  prom_b:\n    type: prometheus\n", "workers.prom_b.url: required"},
 		"empty allowlist":           {"workers:\n  shell:\n    allowlist: []\n", "workers.shell.allowlist: must list at least one binary"},
-		"empty allowlist entry":     {"workers:\n  kc:\n    type: shell\n    allowlist: [kubectl, \"\"]\n", "workers.kc.allowlist: empty entry"},
+		"empty allowlist entry":     {"workers:\n  kc:\n    type: shell\n    allowlist: [dig, \"\"]\n", "workers.kc.allowlist: empty entry"},
 		"negative timeout":          {"workers:\n  prometheus:\n    url: http://p\n    timeout: -1s\n", "workers.prometheus.timeout: must not be negative"},
 		"bad instance name":         {"workers:\n  \"prom prod\":\n    type: prometheus\n    url: http://p\n", "instance name must match"},
 		"prometheus needs settings": {"workers:\n  prometheus: {}\n", "workers.prometheus.url: required"},
@@ -185,8 +185,8 @@ func TestValidateErrors(t *testing.T) {
 func TestValidateProgrammaticConfig(t *testing.T) {
 	cfg := Default()
 	cfg.Workers = Workers{
-		"prod":    {Type: WorkerPrometheus, Prometheus: &Prometheus{URL: "http://p"}},
-		"kubectl": {Type: WorkerShell, Shell: &Shell{Allowlist: []string{"kubectl"}}},
+		"prod": {Type: WorkerPrometheus, Prometheus: &Prometheus{URL: "http://p"}},
+		"dns":  {Type: WorkerShell, Shell: &Shell{Allowlist: []string{"dig"}}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)

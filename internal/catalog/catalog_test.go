@@ -254,7 +254,7 @@ params:
 calls:
   - name: pods
     worker: shell
-    request: {command: kubectl, args: [get, pods, -n, "{{ .ns }}"]}
+    request: {command: list-pods, args: ["{{ .ns }}"]}
     jq: '[.items[].metadata.name]'
   - name: cpu
     worker: prometheus

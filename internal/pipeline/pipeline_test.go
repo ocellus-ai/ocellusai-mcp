@@ -67,7 +67,8 @@ func toolR(t *testing.T, reg worker.Registry, procs processor.Registry, yaml str
 	return tl
 }
 
-// podList mimics `kubectl get pods -o json` with the given pod names.
+// podList is a list of objects with the given pod names, shaped like a
+// Kubernetes API list.
 func podList(names ...string) any {
 	items := make([]any, 0, len(names))
 	for _, n := range names {
@@ -209,7 +210,7 @@ func TestStageErrors(t *testing.T) {
 	}
 }
 
-// callsHead is a two-call tool: kubectl-like pods → per-call jq → Prometheus
+// callsHead is a two-call tool: a pod list → per-call jq → Prometheus
 // query built from the pod names via result "pods".
 const callsHead = `name: t
 description: d
@@ -218,7 +219,7 @@ params:
 calls:
   - name: pods
     worker: kube
-    request: {command: kubectl, ns: "{{ .ns }}"}
+    request: {command: list-pods, ns: "{{ .ns }}"}
     jq: '[.items[].metadata.name]'
   - name: cpu
     worker: prom
@@ -236,7 +237,7 @@ func TestCallsChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if kube.lastReq["ns"] != "dev" || kube.lastReq["command"] != "kubectl" {
+	if kube.lastReq["ns"] != "dev" || kube.lastReq["command"] != "list-pods" {
 		t.Errorf("first request = %#v", kube.lastReq)
 	}
 	if prom.lastReq["query"] != `up{ns="dev", pod=~"a|b"}` {

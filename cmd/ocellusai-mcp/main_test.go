@@ -13,7 +13,7 @@ func TestBuildWorkersInstances(t *testing.T) {
 workers:
   prometheus: {url: http://prom:9090}
   prom_staging: {type: prometheus, url: http://staging:9090}
-  kubectl: {type: shell, allowlist: [kubectl]}
+  dns: {type: shell, allowlist: [dig]}
   am: {type: rest, url: http://alertmanager:9093/api/v2, methods: [GET]}
   off:
 `))
@@ -24,10 +24,10 @@ workers:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(reg.Names(), ","); got != "am,kubectl,prom_staging,prometheus" {
+	if got := strings.Join(reg.Names(), ","); got != "am,dns,prom_staging,prometheus" {
 		t.Errorf("registry = %q", got)
 	}
-	for name, typ := range map[string]string{"prometheus": "prometheus", "prom_staging": "prometheus", "kubectl": "shell", "am": "rest"} {
+	for name, typ := range map[string]string{"prometheus": "prometheus", "prom_staging": "prometheus", "dns": "shell", "am": "rest"} {
 		if reg[name].Type() != typ {
 			t.Errorf("%s: type = %q, want %q", name, reg[name].Type(), typ)
 		}
