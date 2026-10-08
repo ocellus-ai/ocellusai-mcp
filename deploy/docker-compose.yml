@@ -1,0 +1,46 @@
+# ocellusai-mcp on a single host with Docker Compose.
+#
+#   cd deploy
+#   cp .env.example .env              # fill in the values
+#   docker compose up -d
+#   curl -fsS http://127.0.0.1:8080/healthz
+#
+# Configuration is split in two:
+#   config.yaml  structure, committed; deployment-specific values are ${VAR}
+#   .env         the values and secrets, never committed; passed to the container
+#                as its environment, from which ocellusai-mcp fills ${VAR}
+#
+# Config and catalog are read at startup only, so apply changes with
+#   docker compose up -d --force-recreate
+services:
+  ocellusai-mcp:
+    image: ${OCELLUSAI_MCP_IMAGE:-quay.io/ocellusai/ocellusai-mcp:latest}   # TODO: pin the real image/tag
+    container_name: ocellusai-mcp
+    restart: unless-stopped
+    command: ["-config", "/etc/ocellusai-mcp/config.yaml"]
+    env_file: .env
+    volumes:
+      - ./config.yaml:/etc/ocellusai-mcp/config.yaml:ro
+      # Own tool catalog instead of the one baked into the image (replaces it entirely):
+      # - ./tools:/app/tools:ro
+    ports:
+      # The MCP endpoint has no authentication: keep it on 127.0.0.1 unless a
+      # reverse proxy or firewall protects it (MCP_PUBLISH in .env).
+      - "${MCP_PUBLISH:-127.0.0.1:8080}:8080"
+    # Prometheus running on this host outside Docker is reachable as
+    # http://host.docker.internal:<port> with:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    # No healthcheck: the distroless image has no shell, curl or wget to run one.
+    # Probe GET /healthz from outside instead.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

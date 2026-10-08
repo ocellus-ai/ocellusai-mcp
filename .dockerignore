@@ -1,5 +1,30 @@
-bin/
-deploy/
-*.md
+# Git / CI
 .git/
+.github/
+.gitignore
+.gitlab-ci.yml
 .golangci.yml
+.claude/
+
+# Build artifacts
+bin/
+*.test
+coverage.out
+
+# Local configs and env files (may hold real addresses/tokens), deploy files and test material
+config.yaml
+config.stdio.yaml
+**/.env
+tools-test/
+skills/
+scripts/
+deploy/
+
+# Archives and docs are not needed inside the image
+**/*.zip
+**/*.md
+
+# OS / editors
+**/.DS_Store
+__pycache__/
+*.swp

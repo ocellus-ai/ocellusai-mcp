@@ -1,4 +1,5 @@
 # ocellusai-mcp in Kubernetes: Deployment + Service + ConfigMap for config.yaml.
+# Prometheus is the only data source, so the pod needs no Kubernetes API access.
 #
 # The tool catalog lives in a second ConfigMap built straight from the tools/
 # directory, so adding a tool is "add a YAML file, re-create the ConfigMap":
@@ -25,48 +26,9 @@ data:
       prometheus:
         url: http://prometheus.monitoring.svc:9090
         timeout: 15s
-      shell:
-        allowlist: [kubectl, df]
-        timeout: 30s
-        max_output_bytes: 1048576
-        env: {}
-      rest:
-        url: http://alertmanager.monitoring.svc:9093/api/v2
-        timeout: 15s
-        # methods: [GET]   # make the instance read-only if the alertmanager_silence_* actions are not wanted
     log:
       level: info
       format: json
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ocellusai-mcp
-  namespace: monitoring
----
-# Read-only access for the pods_status tool (kubectl inside the pod uses the
-# in-cluster service account). Drop this and the shell worker if unused.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ocellusai-mcp-readonly
-rules:
-  - apiGroups: [""]
-    resources: [pods, namespaces]
-    verbs: [get, list]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ocellusai-mcp-readonly
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: ocellusai-mcp-readonly
-subjects:
-  - kind: ServiceAccount
-    name: ocellusai-mcp
-    namespace: monitoring
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -82,14 +44,13 @@ spec:
     metadata:
       labels: {app: ocellusai-mcp}
     spec:
-      serviceAccountName: ocellusai-mcp
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: ocellusai-mcp
-          # Use the `with-kubectl` image target if the shell worker needs kubectl.
           image: ocellusai-mcp:dev
           imagePullPolicy: IfNotPresent
           args: ["-config", "/etc/ocellusai-mcp/config.yaml"]

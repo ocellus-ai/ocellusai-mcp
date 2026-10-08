@@ -1,0 +1,25 @@
+# ocellusai-mcp configuration for deploy/docker-compose.yml.
+#
+# This file holds the structure only and is safe to commit. Every value that
+# differs between installations is a ${VAR}: ocellusai-mcp fills it from the
+# container environment (deploy/.env) at startup, and an unset variable is a
+# startup error that lists all missing names. Where a value is the same for
+# every installation, write it here directly instead of adding a variable.
+
+server:
+  transport: http          # the container always serves HTTP
+  listen: ":8080"          # MCP endpoint /mcp, health /healthz; the host port is set in docker-compose.yml
+
+tools_dir: ./tools         # the catalog baked into the image (/app/tools)
+
+workers:
+  prometheus:
+    url: ${MCP_PROMETHEUS_URL}
+    timeout: 60s
+    # Uncomment when Prometheus needs a token; MCP_PROMETHEUS_TOKEN then becomes required in .env:
+    # headers:
+    #   Authorization: "Bearer ${MCP_PROMETHEUS_TOKEN}"
+
+log:
+  level: ${MCP_LOG_LEVEL}  # debug | info | warn | error
+  format: json             # json | text (stderr, read it with docker compose logs)

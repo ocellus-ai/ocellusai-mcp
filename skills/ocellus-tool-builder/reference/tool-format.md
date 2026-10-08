@@ -15,9 +15,9 @@
 |---|---|---|---|
 | `name` | yes | the tool name the agent calls | `^[a-z0-9_]+$`, unique in the catalog |
 | `description` | yes | the text the model uses to decide when and how to call the tool | not empty |
-| `worker` | yes, unless `calls` | a worker **instance** name from the config's `workers` (`prometheus`, `prom_staging`, …); its type (`prometheus`, `shell`, `rest`) defines the `request` keys | the instance exists |
+| `worker` | yes, unless `calls` | a Prometheus worker **instance** name from the config's `workers` (`prometheus`, `prom_staging`, …) | the instance exists |
 | `params` | no | call parameters → the tool's `inputSchema` | rules below; defaults are checked against the schema |
-| `request` | yes, unless `calls` | the worker request | keys and types by the worker, template syntax |
+| `request` | yes, unless `calls` | the Prometheus query ([prometheus.md](prometheus.md#request-keys)) | keys and types, template syntax |
 | `calls` | no; replaces `worker` + `request` | several named calls in sequence ([calls.md](calls.md)) | names, instances, each request, per-call `jq`, `result` references |
 | `process` | no | list of processing steps `{fn, with}` ([processors.md](processors.md)) | `fn` exists, `with` keys by the processor, template syntax |
 | `response.jq` | no | final gojq expression | compiles |
@@ -55,7 +55,7 @@ response:
 - `worker`/`request` and `calls` are mutually exclusive.
 - **Quote values that start with `{{`**: `step: "{{ .step }}"`. Unquoted, YAML reads `{` as a map.
   The same for values starting with `*`, `&`, `!`, `%`, `@`, `` ` `` or containing `: ` or ` #`.
-- Multi-line values (`description`, `query`, `jq`, `render`, string `body`) use the block style `|`:
+- Multi-line values (`description`, `query`, `jq`, `render`) use the block style `|`:
   no escaping of quotes, `{}` or `#` inside.
 - Single-line jq is easiest in single quotes: `jq: '[.result[] | .metric.job]'` (a single quote inside
   is doubled: `''`).
@@ -79,14 +79,13 @@ reader of the YAML.
 Include:
 
 1. **What it returns and about which object** — first sentence.
-2. **Data source and requirements**: exporter (node_exporter, kube-state-metrics), command, API.
+2. **Data source and requirements**: exporter and metrics (node_exporter, kube-state-metrics).
 3. **Non-obvious parameter semantics**: how names match (regex?), threshold units, what `0` means.
 4. **Result shape and units**: key fields, percent/bytes/seconds, sorting, limits.
 5. **Empty result** and what it means ("[] means all targets are up").
 6. **When to use it** and how it differs from neighbouring tools.
 7. **Limits and cost** ("for windows longer than a day raise `step`").
 8. **Data quirks** that affect conclusions ("steal is counted in 10ms ticks, so…").
-9. For actions: "This is an action: …" and what it changes.
 
 Avoid: retelling the PromQL or implementation, marketing, repeating the parameter schema (the agent
 sees it anyway).
@@ -173,9 +172,7 @@ prints `<no value>`: test it with `{{ if .x }}` or give a `default`.
 | `at`: now, now-<duration>, RFC3339 | `^(now(-[0-9]+[smhdwy])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2}))$` |
 | Kubernetes name / namespace | `^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$` |
 | Host name | `^[A-Za-z0-9][A-Za-z0-9._-]*$` |
-| Shell argument without option injection | `^[^-].*$` (or a stricter one) |
 | Numeric id | `^[0-9]+$` |
-| Kubernetes label selector (empty allowed, no leading `-`) | `^([A-Za-z0-9._/][A-Za-z0-9._/=!,() -]*)?$` |
 
 ### Recommendations
 
@@ -197,7 +194,7 @@ helpers.
 
 | Place | Root `.` | `param "x"` | `result "name"` |
 |---|---|---|---|
-| `request`: every string, including list items and nested maps | params | yes | no |
+| `request`: every string | params | yes | no |
 | `calls[i].request`: every string | params | yes | results of calls **before** i |
 | `process[i].with`: every string | params | yes | all calls |
 | `response.render` | the jq result (or the previous stage's output when there is no jq) | yes | all calls |
@@ -218,7 +215,6 @@ helpers.
 | `promRegex v` | escapes RE2 metacharacters so the value matches literally | `db.1` → `db\.1` |
 | `promDuration v` | validates a Prometheus duration, returns the canonical form; invalid → error at stage `request` | `[{{ promDuration .window }}]`, `60s` → `1m` |
 | `promDurationSeconds v` | the same in whole seconds | `{{ promDurationSeconds .step }}` |
-| `pathEscape v` | escapes one URL path segment (rest) | `/silence/{{ pathEscape .id }}` |
 | `param "name"` | a parameter value; needed in `render`, where `.` is not the params | `{{ param "window" }}` |
 | `result "name"` | the result of an earlier call of `calls` (after its jq) | `{{ range result "pods" }}{{ .pod }}{{ end }}` |
 
@@ -234,7 +230,6 @@ helpers.
 | `kindIs "invalid" .x` | nil check that does not confuse nil with zero |
 | `hasPrefix`, `trimPrefix`, `join`, `upper`, `lower`, `trim`, `replace` | strings |
 | `list`, `append`, `dict`, `get`, `hasKey` | lists and maps: `{{ get (dict "cpu" 5 "mem" 3) .signal }}` |
-| `toJson` | quoting values inside a JSON string body |
 | `now`, `toDate`, `dateModify`, `dateInZone` | time arithmetic |
 | `fail "msg"` | stop with an error at render time (validate parameter combinations) |
 | `len`, `index`, `eq ne lt le gt ge`, `and or not` | built into text/template |

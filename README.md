@@ -351,11 +351,10 @@ tool are errors too. [`config.example.yaml`](config.example.yaml) lists every op
 ## Deployment
 
 ```bash
-make docker                                                  # distroless, non-root, prometheus and rest workers
-docker build --target with-kubectl -t ocellusai-mcp:kubectl .   # adds kubectl for the shell worker
+make docker   # distroless, non-root, no CLI binaries inside
 ```
 
-[`deploy/k8s.yaml`](deploy/k8s.yaml) has a Deployment, a Service, a ConfigMap with the config and RBAC to read pods.
+[`deploy/k8s.yaml`](deploy/k8s.yaml) has a Deployment, a Service and a ConfigMap with the config.
 The tool catalog is a second ConfigMap built from the directory:
 
 ```bash

@@ -72,8 +72,8 @@ process:
 
 - The only key is `expr`, compiled at startup (`process[0] (jq): with.expr: jq parse: …`).
 - Output like `response.jq`: zero outputs → `null`, one → as is, several → an array.
-- Uses: pick an input from `{name: result}`; build `[{key, value}]` for `outliers` from a vector,
-  `df` lines or a REST answer; flatten a report into events for `cluster_events`; narrow a report.
+- Uses: pick an input from `{name: result}`; build `[{key, value}]` for `outliers` from a vector;
+  flatten a report into events for `cluster_events`; narrow a report.
 - Don't use it for the final answer shape: that is `response.jq`.
 
 ## anomaly
@@ -123,8 +123,8 @@ points than `min_points` (2 h at 60 s = 120 points). Template: [../templates/pro
 ## outliers
 
 Outliers in a **set of objects without a time axis**: each object is compared with the others of its
-group, not with its own history (filesystems, pods, an instant vector, REST rows). Same detectors and
-detector keys as `anomaly`.
+group, not with its own history (filesystems, pods, an instant vector). Same detectors and detector
+keys as `anomaly`.
 
 Input, built by a preceding `jq` step:
 
@@ -161,9 +161,8 @@ series with a `reason`.
 ```
 
 Small sets: the z-score of `n` objects never exceeds `(n−1)/√n` (2.04 for six objects), so `zscore`
-with threshold 3 never fires on a handful of objects; use `iqr`. Idioms: instant vector
-`[.result[] | {key: .metric.<label>, value: .value[1]}]`; REST `[.[] | {key: .id, value: .duration,
-labels: {ref: .ref}}]` with `group_by: [ref]`. Template: [../templates/prometheus-outliers.yaml](../templates/prometheus-outliers.yaml).
+with threshold 3 never fires on a handful of objects; use `iqr`. Idiom: instant vector
+`[.result[] | {key: .metric.<label>, value: .value[1]}]`. Template: [../templates/prometheus-outliers.yaml](../templates/prometheus-outliers.yaml).
 
 ## join
 

@@ -5,3 +5,5 @@ coverage.out
 /config.yaml
 /config.stdio.yaml
 __pycache__/
+.env
+.gitlab-ci.yml

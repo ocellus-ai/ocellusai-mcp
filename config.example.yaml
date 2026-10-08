@@ -4,13 +4,11 @@ server:
   transport: http          # stdio | http
   listen: ":8080"          # http only; the MCP endpoint is /mcp, health is /healthz
 
-tools_dir: ./tools         # every *.yaml here is one tool (relative to the working directory);
-                           # ./tools-test holds the tools the test suite calls
+tools_dir: ./tools         # every *.yaml here is one tool (relative to the working directory)
 
 # Every entry under workers is one worker *instance*; tools reference it as
-# `worker: <name>`. The optional `type` (prometheus | shell | rest) selects the
-# code and defaults to the entry name, so `prometheus:`, `shell:` and `rest:`
-# need no type field.
+# `worker: <name>`. The optional `type` defaults to the entry name, so
+# `prometheus:` needs no type field.
 workers:
   prometheus:
     url: http://localhost:9090
@@ -22,27 +20,6 @@ workers:
   # prom_staging:
   #   type: prometheus
   #   url: http://prometheus.staging:9090
-  shell:
-    allowlist: [kubectl, helm, df]   # only these binaries may be referenced by request.command
-    timeout: 30s
-    max_output_bytes: 1048576
-    env: {}                          # child env = PATH + these entries, nothing else
-    # env: {KUBECONFIG: /etc/kube/config}
-  rest:
-    url: http://localhost:9093/api/v2   # base URL; tools give a path relative to it (tools-test/alertmanager_*: Alertmanager API v2)
-    timeout: 15s
-    max_response_bytes: 1048576      # a larger response is an error, JSON cannot be truncated
-    # headers:                       # sent with every request, override request.headers, never logged
-    #   Authorization: "Bearer ${AM_TOKEN}"
-    # methods: [GET]                 # allowed HTTP methods; default GET, POST, PUT, PATCH, DELETE
-    # ca_file: /etc/ssl/internal.pem # PEM bundle for a private CA
-    # insecure_skip_verify: false
-  # Any JSON API works the same way, e.g. a read-only GitLab instance:
-  # gitlab:
-  #   type: rest
-  #   url: https://gitlab.example.com/api/v4
-  #   headers: {PRIVATE-TOKEN: "${GITLAB_TOKEN}"}
-  #   methods: [GET]
 
 log:
   level: info              # debug | info | warn | error
