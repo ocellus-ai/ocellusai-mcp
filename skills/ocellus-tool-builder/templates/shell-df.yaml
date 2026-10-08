@@ -1,0 +1,42 @@
+# Template: shell worker (a command from the instance allowlist, no shell, one
+# argument per args element) → parse: lines → jq → render. Filesystems of the
+# ocellusai-mcp host that are filling up, via df.
+# Adapt: the command and its arguments, the jq that splits its lines into
+# fields. The server's shell instance needs df in its allowlist.
+name: filesystems_filling_up
+description: |
+  Filesystems of the ocellusai-mcp host whose usage is at or above `threshold`
+  percent (df). Filesystems smaller than `min_size_gib` (pseudo filesystems
+  such as devfs) are left out. Returns how many filesystems were checked and,
+  per full one, its device, mount point, used percent and free space in GiB,
+  fullest first. An empty list means no filesystem is that full.
+
+params:
+  threshold:    {type: integer, default: 80, minimum: 0, maximum: 100, description: "Used percent at or above which a filesystem is reported"}
+  min_size_gib: {type: number, default: 1, minimum: 0, description: "Skip filesystems smaller than this, in GiB"}
+
+worker: shell
+request:
+  command: df
+  args: [-P, -k]          # POSIX format, sizes in KiB: the same columns on Linux and macOS
+  parse: lines
+  timeout: 10s
+
+response:
+  # The numeric columns anchor the match, so spaces in the device or the mount
+  # point (macOS "map auto_home") survive; the header line does not match.
+  jq: |
+    [ .[]
+      | capture("^(?<device>.+?) +(?<size>[0-9]+) +[0-9]+ +(?<free>[0-9]+) +(?<used>[0-9]+)% +(?<mount>.+)$")
+      | {device, mount, size_kib: (.size | tonumber), free_kib: (.free | tonumber), used_pct: (.used | tonumber)}
+      | select(.size_kib >= $params.min_size_gib * 1048576) ] as $fs
+    | {
+        checked: ($fs | length),
+        full: ([ $fs[] | select(.used_pct >= $params.threshold)
+                 | {device, mount, used_pct, free_gib: (.free_kib / 1048576)} ] | sort_by(-.used_pct))
+      }
+  render: |
+    {{ if not .full }}None of {{ .checked }} filesystem(s) is {{ param "threshold" }}% full or more.{{ else -}}
+    {{ len .full }} of {{ .checked }} filesystem(s) at or above {{ param "threshold" }}%:
+    {{ range .full }}- {{ .mount }} ({{ .device }}): {{ .used_pct }}% used, {{ printf "%.1f" (float64 .free_gib) }} GiB free
+    {{ end }}{{ end }}

@@ -10,15 +10,22 @@
 
 ## Validate
 
+**Ask first.** Running `-validate` runs the user's software, and building the binary compiles their
+project. Do either only after the user agreed to that exact command (see "Ask before you run anything"
+in [../SKILL.md](../SKILL.md)). If there is no binary or no repository, don't download, install or
+build anything: give the user the commands below, tell them what a good result looks like, and offer to
+read the output if they paste it.
+
 `-validate` loads the config and the whole catalog with the same code as a server start and prints
 one line per tool. It is offline: it does not contact Prometheus, run commands or call APIs.
 
 ```bash
-./bin/ocellus-ai -config config.yaml -validate
+./bin/ocellusai-mcp -config config.yaml -validate
 ```
 
-(In a source checkout `make build` builds `bin/ocellus-ai`; `make validate` validates the example
-config.) Look for your tool's line, e.g.
+(In a source checkout `make build` builds `bin/ocellusai-mcp`, and `make validate` builds and validates the
+example config: both compile the project, so they need the user's permission like any build.) Look for
+your tool's line, e.g.
 `node_memory_top  worker=prometheus  type=prometheus  calls=-  process=-  file=tools/node_memory_top.yaml`.
 With `calls` and `process` the columns show the chains (`calls=cpu>mem`, `process=join>anomaly_ensemble`).
 
@@ -31,7 +38,7 @@ start); for validation only, dummy values are fine.
 ```bash
 mkdir -p /tmp/ocellus-check/tools && cp tools/node_memory_top.yaml /tmp/ocellus-check/tools/
 sed 's#^tools_dir:.*#tools_dir: /tmp/ocellus-check/tools#' config.yaml > /tmp/ocellus-check/config.yaml
-./bin/ocellus-ai -config /tmp/ocellus-check/config.yaml -validate
+./bin/ocellusai-mcp -config /tmp/ocellus-check/config.yaml -validate
 ```
 
 `-validate` checks structure, parameter schemas, request keys, template syntax and function names,
@@ -40,8 +47,10 @@ commands, real data or the answer's formatting. Only a call does.
 
 ## Test call
 
-Ask the user before calling: the tool queries their real systems. **Never call an action tool**
-(non-GET REST, a mutating command) without explicit permission for the exact arguments.
+Ask the user before calling: a call starts ocellusai-mcp and queries their real systems. **Never call an
+action tool** (non-GET REST, a mutating command) without explicit permission for the exact arguments.
+If the user prefers to call it themselves, or nothing can be run where you are, give them the commands
+below with the arguments to try.
 
 The repository ships a stdlib-only client, `scripts/mcp-call.py`. It starts the server over stdio, so
 it needs a config with `server.transport: stdio`; make a scratch copy rather than editing the user's
@@ -49,12 +58,12 @@ config:
 
 ```bash
 sed 's#^\([[:space:]]*transport:\).*#\1 stdio#' /tmp/ocellus-check/config.yaml > /tmp/ocellus-check/stdio.yaml
-python3 scripts/mcp-call.py -bin ./bin/ocellus-ai -config /tmp/ocellus-check/stdio.yaml -quiet list
-python3 scripts/mcp-call.py -bin ./bin/ocellus-ai -config /tmp/ocellus-check/stdio.yaml -quiet call node_memory_top '{"top": 3}' --structured
+python3 scripts/mcp-call.py -bin ./bin/ocellusai-mcp -config /tmp/ocellus-check/stdio.yaml -quiet list
+python3 scripts/mcp-call.py -bin ./bin/ocellusai-mcp -config /tmp/ocellus-check/stdio.yaml -quiet call node_memory_top '{"top": 3}' --structured
 ```
 
 Use absolute paths for `tools_dir` in a scratch config if you run from another directory. Without the
-script, any MCP client works (for example `claude mcp add ocellus -- /path/to/bin/ocellus-ai -config
+script, any MCP client works (for example `claude mcp add ocellus -- /path/to/bin/ocellusai-mcp -config
 /path/to/stdio.yaml`).
 
 To see the rendered request (the final PromQL, command line or URL path), set `log.level: debug` in
@@ -152,37 +161,42 @@ With `calls`, errors of the stages `request`, `worker` and per-call `jq` start w
 
 **Verification**
 
-- [ ] `-validate` passes.
-- [ ] A call with defaults, an empty result and invalid arguments has been tried (or the user has the
-      commands to try them).
+- [ ] `-validate` passed (run with the user's permission), or the user has the command and knows what
+      to look for.
+- [ ] A call with defaults, an empty result and invalid arguments has been tried with the user's
+      permission, or the user has the commands to try them.
+- [ ] Nothing was built, installed, downloaded or run without the user's explicit yes.
 - [ ] No temporary test values (`time: now-1d`, a narrowed filter) left in the file.
 
 ## Deliver
 
 Tell the user, in their language:
 
-1. **Where the file is** (`tools/<name>.yaml`) and that `-validate` passed (or what could not be run).
+1. **Where the file is** (`tools/<name>.yaml`), and whether `-validate` and a test call were run (with
+   the user's permission) or are left to the user, with the commands to run them.
 2. **What the agent sees**: the name, the first sentence of the description, the parameters with
    defaults.
 3. **A sample answer** from the test call (a few lines), or the expected shape if no call was made.
 4. **Assumptions to check**: metric names, `job` labels, units, the worker instance, the environment
    of a shell command.
-5. **How to deploy**: the server reads the catalog only at startup.
-   - Local: restart ocellus-ai.
+5. **How to deploy**: the server reads the catalog only at startup. These are commands for the user;
+   don't run deployment commands yourself.
+   - Local: restart ocellusai-mcp.
    - Kubernetes: rebuild the tools ConfigMap from the directory and restart:
 
      ```bash
-     kubectl -n monitoring create configmap ocellus-ai-tools --from-file=tools/ --dry-run=client -o yaml | kubectl apply -f -
+     kubectl -n monitoring create configmap ocellusai-mcp-tools --from-file=tools/ --dry-run=client -o yaml | kubectl apply -f -
      ```
 
      ```bash
-     kubectl -n monitoring rollout restart deployment/ocellus-ai
+     kubectl -n monitoring rollout restart deployment/ocellusai-mcp
      ```
 
      Keep only YAML in the directory (no `.DS_Store`, archives, drafts); ConfigMap keys allow only
      `[-._a-zA-Z0-9]`, so file names must be ASCII; the ConfigMap is limited to 1 MiB.
-   - A shell tool in Kubernetes needs an image with the command (`with-kubectl` target), the command in
-     the allowlist and its environment in the instance's `env`.
+   - A shell tool in Kubernetes needs an image with the command (the default image has none: copy the
+     static binary into one that has it), the command in the allowlist and its environment in the
+     instance's `env`.
    - A new worker instance (a REST API, a second Prometheus) is a config change: give the snippet.
 
 Offer the next step in one line (e.g. a sibling tool, a tighter default) instead of building it

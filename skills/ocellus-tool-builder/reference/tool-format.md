@@ -210,7 +210,7 @@ helpers.
   `{{ .namepace }}` passes `-validate` and fails on the first call (`map has no entry for key
   "namepace"`). Hence the test call.
 
-### ocellus-ai helpers
+### ocellusai-mcp helpers
 
 | Function | Does | Example |
 |---|---|---|

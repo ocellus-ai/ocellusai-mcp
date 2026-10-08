@@ -143,8 +143,7 @@ systems every time an agent calls the tool. Before writing one:
   obstacle — don't suggest weakening it casually;
 - make the dangerous inputs `required` with tight `pattern`s; no "match everything" defaults;
 - the `description` starts the effect sentence with "This is an action: …";
-- shell tools that mutate state (`kubectl delete`, `scale`, `rollout restart`) are strongly
-  discouraged: warn, and write one only on the user's explicit insistence;
+- shell tools that change state (delete files, restart services) are strongly discouraged: warn, and write one only on the user's explicit insistence;
 - never test-call an action tool without explicit permission for the exact arguments.
 
 ## Defaults when the user says "you decide"

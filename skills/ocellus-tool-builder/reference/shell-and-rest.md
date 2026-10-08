@@ -20,48 +20,45 @@ Runs one command from the instance's allowlist and returns its output.
 | `timeout` | a **Go** duration (`20s`, `1m30s`); overrides the instance's `timeout` (30 s by default) |
 
 ```yaml
-name: pods_status
+name: dns_lookup
 description: |
-  Pods of a namespace with phase, readiness and total restarts, via kubectl.
-  Returns [{pod, phase, ready, restarts}].
+  Addresses a DNS name resolves to (dig), with the CNAME chain on the way.
+  Returns {name, cnames: [...], addresses: [...]}.
 worker: shell
 params:
-  namespace: {type: string, required: true, description: "Kubernetes namespace, e.g. prod", pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+  name: {type: string, required: true, description: "DNS name such as api.example.internal", pattern: "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\\.?$"}
 request:
-  command: kubectl
-  args: [get, pods, -n, "{{ .namespace }}", -o, json]
-  parse: json
-  timeout: 20s
+  command: dig
+  args: [+short, A, "{{ .name }}"]
+  parse: lines
+  timeout: 10s
 response:
   jq: |
-    [.items[] | (.status.containerStatuses // []) as $cs | {
-      pod: .metadata.name,
-      phase: .status.phase,
-      ready: (($cs | length) > 0 and ($cs | all(.ready))),
-      restarts: ([$cs[] | .restartCount] | add // 0)
-    }]
+    {
+      name: $params.name,
+      cnames: [.[] | select(endswith("."))],
+      addresses: [.[] | select(test("^[0-9]+(\\.[0-9]+){3}$"))]
+    }
 ```
 
 ### How the command runs
 
 - **No shell.** There is no `sh -c`, so `|`, `>`, `&&`, `*`, `~`, `$VAR` do not work. Filter in jq or
   with the command's own options. Don't put `sh` or `bash` in an allowlist to get around it.
-- **Empty environment:** only `PATH` and the instance's `env`. `HOME`, `KUBECONFIG`,
-  `KUBERNETES_SERVICE_*` are not passed; whatever the command needs goes into `env` of the instance
-  (inside a pod, kubectl needs `KUBERNETES_SERVICE_HOST`/`KUBERNETES_SERVICE_PORT` there).
-- **Each `args` element is exactly one argument.** `"-n {{ .namespace }}"` passes one string `-n prod`
-  with a space inside. Write `[-n, "{{ .namespace }}"]`.
+- **Empty environment:** only `PATH` and the instance's `env`. `HOME`, `LANG`, proxies and the
+  rest are not passed; whatever the command needs goes into `env` of the instance.
+- **Each `args` element is exactly one argument.** `"-t {{ .type }}"` passes one string `-t MX`
+  with a space inside. Write `[-t, "{{ .type }}"]`.
 - An argument cannot be removed conditionally; design arguments so an empty value is harmless
-  (kubectl treats `-l ""` as "no selector").
+  (an empty string is still an argument, and most commands reject it).
 - Numbers and booleans in `args` become strings; lists and maps are not allowed.
-- **Option injection.** A parameter value starting with `-` becomes an option (`--kubeconfig=…`,
-  `-A`). Forbid a leading dash in `pattern`, or put `--` before positional arguments if the command
-  supports it.
+- **Option injection.** A parameter value starting with `-` becomes an option (`-f /etc/passwd`); for
+  dig, `@…` and `+…` are special too. Forbid such a start in `pattern` (a host name pattern does), or
+  put `--` before positional arguments if the command supports it.
 - `timeout` uses Go syntax: `1d` does **not** work, write `24h`.
-- The command runs on the ocellus-ai host (or in its container: the default image has no kubectl, the
-  `with-kubectl` target adds it).
-- Prefer read-only commands. A mutating command (`delete`, `scale`, `apply`) runs every time an agent
-  calls the tool.
+- The command runs on the ocellusai-mcp host, or in its container: the default image has no command-line
+  programs, so copy the static `ocellusai-mcp` binary into an image that has the commands you list.
+- Prefer read-only commands. A command that changes state runs every time an agent calls the tool.
 
 ### parse and output limits
 

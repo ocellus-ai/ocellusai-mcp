@@ -1,0 +1,51 @@
+# Template: calls — dig resolves a name (per-call jq returns a flat list of
+# addresses), then Prometheus is asked about exactly those hosts (regex built
+# from the first result), response.jq joins both by address.
+# Adapt: the first source and its flat shape, the metric of the second call,
+# the join key. The server's shell instance needs dig in its allowlist.
+name: dns_hosts_cpu
+description: |
+  Resolves a DNS name and shows the CPU busy percent of every IPv4 address
+  behind it, from node_exporter (job node_exporters). Resolves the name with
+  dig, then queries Prometheus for exactly those addresses over the last
+  `window` and joins both by address. Returns [{address, cpu_pct}], busiest
+  first; cpu_pct is null for an address without node_exporter samples. Needs
+  both dig on the ocellusai-mcp host and Prometheus; with only one of them use a
+  DNS-only or a Prometheus-only tool.
+
+params:
+  # Host names only: the value can never become a dig option such as -f or @server.
+  name:   {type: string, required: true, description: "DNS name such as db.example.internal", pattern: "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\\.?$"}
+  window: {type: string, default: "5m", description: "Rate window such as 5m or 1h", pattern: "^[0-9]+[smhdwy]$"}
+
+calls:
+  - name: addrs
+    worker: shell
+    request:
+      command: dig
+      args: [+short, A, "{{ .name }}"]
+      parse: lines
+      timeout: 10s
+    # dig +short also prints the CNAME chain; keep the addresses only.
+    jq: '[.[] | select(test("^[0-9]+(\\.[0-9]+){3}$"))] | unique'
+  - name: cpu
+    worker: prometheus
+    request:
+      type: instant
+      query: |
+        {{- $addrs := list }}{{ range result "addrs" }}{{ $addrs = append $addrs (promRegex .) }}{{ end -}}
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{
+          job="node_exporters", mode="idle",
+          instance=~{{ promLabel (printf "(%s)(:[0-9]+)?" (join "|" $addrs | default "__none__")) }}
+        }[{{ promDuration .window }}])))
+
+response:
+  jq: |
+    (.cpu.result | map({key: (.metric.instance | sub(":[0-9]+$"; "")), value: (.value[1] | tonumber? // null)}) | from_entries) as $cpu
+    | [.addrs[] | {address: ., cpu_pct: $cpu[.]}]
+    | sort_by(-(.cpu_pct // -1))
+  render: |
+    {{ if not . }}{{ param "name" }} does not resolve to an IPv4 address.{{ else -}}
+    {{ param "name" }}: {{ len . }} address(es), CPU busy over the last {{ param "window" }}:
+    {{ range . }}- {{ .address }}: {{ if kindIs "invalid" .cpu_pct }}no node_exporter samples{{ else }}{{ printf "%.1f%%" (float64 .cpu_pct) }}{{ end }}
+    {{ end }}{{ end }}
