@@ -1,7 +1,5 @@
 # Writing a worker
 
-[Architecture](architecture.md) · [Components](components.md) · **Writing a worker** · [Writing a processor](writing-processors.md)
-
 A worker type is the code that talks to one kind of data source. Ocellus AI has three: `prometheus`, `shell` and
 `rest`. This guide explains when a new type is worth writing, what the server expects from it, and then builds one
 step by step: a `file` worker that reads files under a configured directory. Every code block of the tutorial
@@ -9,24 +7,6 @@ compiles, passes its tests and `golangci-lint`, and the example tool was called 
 
 Read [Architecture](architecture.md) first: it explains the pipeline a worker plugs into and the rules about values,
 errors and concurrency that this guide applies.
-
-## Contents
-
-- [Do you need a new worker?](#do-you-need-a-new-worker)
-- [How the server uses a worker](#how-the-server-uses-a-worker)
-- [The contract](#the-contract)
-- [Tutorial: a file worker](#tutorial-a-file-worker)
-  - [1. Design the instance and the request](#1-design-the-instance-and-the-request)
-  - [2. The package](#2-the-package)
-  - [3. Unit tests](#3-unit-tests)
-  - [4. The config section](#4-the-config-section)
-  - [5. The factory](#5-the-factory)
-  - [6. Try it](#6-try-it)
-- [A tool test](#a-tool-test)
-- [Patterns from the built-in workers](#patterns-from-the-built-in-workers)
-- [Documentation](#documentation)
-- [Checklist](#checklist)
-- [Common mistakes](#common-mistakes)
 
 ## Do you need a new worker?
 
@@ -956,10 +936,10 @@ A worker type is only as useful as its documentation. Update:
 - [`docs/workers.md`](workers.md): a row in the table at the top, and a section like the others: *Connecting* (the
   instance keys with defaults), *What a tool asks for* (the request keys), *What comes back*, *Errors* (the messages
   and their causes), plus rows in the error reference at the end;
-- [`config.example.yaml`](../config.example.yaml): a commented example instance;
-- [`README.md`](../README.md): the list of sources under *Features*;
+- [`config.example.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/config.example.yaml): a commented example instance;
+- [`README.md`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/README.md): the list of sources under *Features*;
 - the lists of worker types in [User guide](user-guide.md) and [Architecture](architecture.md);
-- [`skills/ocellus-tool-builder/`](../skills/ocellus-tool-builder): a reference page and a template, if agents should
+- [`skills/ocellus-tool-builder/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/skills/ocellus-tool-builder): a reference page and a template, if agents should
   write tools for the new source.
 
 ## Checklist

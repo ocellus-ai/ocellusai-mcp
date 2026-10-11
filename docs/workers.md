@@ -1,7 +1,5 @@
 # Workers
 
-[For DevOps](for-devops.md) · [Quick start](quick-start.md) · [User guide](user-guide.md) · **Workers** · [Templates and jq](templates-and-jq.md) · [Processors](processors.md) · [Writing tools](writing-tools.md)
-
 A worker is how Ocellus AI reaches a data source. This guide explains how to connect each kind of source in the
 config, what a tool can ask of it, what comes back and which errors to expect.
 
@@ -12,15 +10,6 @@ There are three worker types:
 | [`prometheus`](#prometheus) | the Prometheus HTTP query API | Prometheus, VictoriaMetrics, Thanos, Mimir, Cortex |
 | [`shell`](#shell) | command-line programs on the server's host | `df`, `dig` |
 | [`rest`](#rest) | one JSON HTTP API under a base URL | Alertmanager, GitLab, Grafana, an internal API |
-
-## Contents
-
-- [Types and instances](#types-and-instances)
-- [prometheus](#prometheus)
-- [shell](#shell)
-- [rest](#rest)
-- [Several sources in one tool](#several-sources-in-one-tool)
-- [Error reference](#error-reference)
 
 ## Types and instances
 
@@ -364,7 +353,7 @@ workers:
     methods: [GET, POST, DELETE]
 ```
 
-The reference tools [`tools-test/alertmanager_*.yaml`](../tools-test) use an instance named `rest` pointing at the
+The reference tools [`tools-test/alertmanager_*.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools-test) use an instance named `rest` pointing at the
 Alertmanager v2 API: one lists silences, one creates a silence, one expires a silence.
 
 ### What a tool asks for
@@ -453,7 +442,7 @@ calls:
 - The results reach the rest of the tool as an object `{addrs: …, up: …}`.
 
 The whole tool, with the join of both results by address, is
-[`tools-test/dns_targets_up.yaml`](../tools-test/dns_targets_up.yaml).
+[`tools-test/dns_targets_up.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools-test/dns_targets_up.yaml).
 
 Typical uses: a list from one system and metrics from another; the same query against production and staging; one
 range query per metric, stitched together by the `join` processor for multi-metric analysis. How the templates and

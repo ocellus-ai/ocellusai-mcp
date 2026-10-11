@@ -1,7 +1,5 @@
 # Quick start
 
-[For DevOps](for-devops.md) · **Quick start** · [User guide](user-guide.md) · [Workers](workers.md) · [Templates and jq](templates-and-jq.md) · [Processors](processors.md) · [Writing tools](writing-tools.md)
-
 This page takes you from nothing to an AI agent asking your Prometheus questions through Ocellus AI. It takes about
 fifteen minutes if you already have a Prometheus with node_exporter.
 
@@ -82,7 +80,7 @@ workers:
 `${PROM_TOKEN}` is read from the environment when the server starts. If the variable is not set, the server refuses
 to start and names it.
 
-[`config.example.yaml`](../config.example.yaml) lists every option with comments. The [Workers](workers.md) guide
+[`config.example.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/config.example.yaml) lists every option with comments. The [Workers](workers.md) guide
 explains how to connect a second Prometheus, a command-line program or an HTTP API.
 
 ## 3. Validate
@@ -110,7 +108,7 @@ ocellusai-mcp: config.yaml: environment variables not set: PROM_TOKEN
 
 ## 4. Match the catalog to your labels
 
-The tools in [`tools/`](../tools) are real PromQL written for a typical setup. A tool that loads fine can still return
+The tools in [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) are real PromQL written for a typical setup. A tool that loads fine can still return
 nothing if your scrape jobs are named differently. Each file says what it expects in its header comment. The
 assumptions are:
 
@@ -243,7 +241,7 @@ happened on db-01 last Tuesday around 02:00 UTC?"
 
 ## Calling tools without an agent
 
-[`scripts/mcp-call.py`](../scripts/mcp-call.py) needs only Python 3. It starts the server over stdio, lists the tools or
+[`scripts/mcp-call.py`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/scripts/mcp-call.py) needs only Python 3. It starts the server over stdio, lists the tools or
 calls one, and prints the answer. It needs a config with `server.transport: stdio`:
 
 ```bash

@@ -1,7 +1,5 @@
 # Writing tools
 
-[For DevOps](for-devops.md) · [Quick start](quick-start.md) · [User guide](user-guide.md) · [Workers](workers.md) · [Templates and jq](templates-and-jq.md) · [Processors](processors.md) · **Writing tools**
-
 A tool is one YAML file: it says where the data comes from, how to analyse it and what the agent reads back. A new
 tool needs no code and no rebuild, only a file in the catalog and a restart. This guide shows how to design and
 write your own tools, from the question you want an agent to answer to a validated file in production.
@@ -9,24 +7,6 @@ write your own tools, from the question you want an agent to answer to a validat
 It assumes a running server ([Quick start](quick-start.md)). The languages inside a tool file are explained in
 [Templates and jq](templates-and-jq.md), the sources in [Workers](workers.md), the analysis steps in
 [Processors](processors.md); this guide shows how to put them together.
-
-## Contents
-
-- [The workflow](#the-workflow)
-- [Design before you write](#design-before-you-write)
-- [Anatomy of a tool file](#anatomy-of-a-tool-file)
-- [Tutorial: your first tool](#tutorial-your-first-tool)
-- [Patterns](#patterns)
-- [Writing the description](#writing-the-description)
-- [Designing parameters](#designing-parameters)
-- [Designing the answer](#designing-the-answer)
-- [Thresholds for detectors](#thresholds-for-detectors)
-- [Safety](#safety)
-- [Validate and test](#validate-and-test)
-- [Common mistakes](#common-mistakes)
-- [Deploy](#deploy)
-- [Checklist](#checklist)
-- [Let an AI agent write the tool](#let-an-ai-agent-write-the-tool)
 
 ## The workflow
 
@@ -568,7 +548,7 @@ web-1:9100 (usually cpu 25.1%, steal 0.07%):
   segments.
 - The answer reads the segment in the metric's units (`values` at the peak, `baseline` as the usual level) and names
   the leading metric from `top_metrics`.
-- The bundled [`node_deep_ensemble`](../tools/node_deep_ensemble.yaml) takes the same approach to ten signals.
+- The bundled [`node_deep_ensemble`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/node_deep_ensemble.yaml) takes the same approach to ten signals.
 
 ### Trend and forecast
 
@@ -652,7 +632,7 @@ web-2:9100: 33..83, peak at 2026-03-12T13:25:00Z, 38 at 2026-03-13T00:00:00Z; ac
   and `window` a multiple of the period (`1d`).
 - Don't hand the agent 288 forecast points per day: summarise them in jq (low, peak and its time, end value).
 - Show why a forecast should not be trusted (`broken`, `warning`) and put such objects last.
-- The bundled [`node_forecast`](../tools/node_forecast.yaml) summarises a forecast over an interval the agent
+- The bundled [`node_forecast`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/node_forecast.yaml) summarises a forecast over an interval the agent
   chooses ("tomorrow 09:00–18:00"), with time above a threshold.
 
 ### A command-line tool
@@ -714,7 +694,7 @@ response:
   point with spaces in one piece, and the header line simply does not match.
 - Neither parameter reaches the command: both are read in jq as `$params`, so nothing a caller passes ends up on
   the command line. When a parameter does go into `args`, constrain it so that it cannot become an option of the
-  program. [`tools-test/dns_targets_up.yaml`](../tools-test/dns_targets_up.yaml) passes a DNS name to `dig` and allows
+  program. [`tools-test/dns_targets_up.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools-test/dns_targets_up.yaml) passes a DNS name to `dig` and allows
   host names only:
 
   ```text
@@ -841,16 +821,16 @@ Silence 5c1d2e3f-0a9b-4c7d-8e6f-1a2b3c4d5e6f created for HostOutOfDiskSpace on w
 
 | Technique | See |
 |---|---|
-| Two sources in one tool: dig resolves a name, Prometheus says which of its addresses are scraped and up | [`tools-test/dns_targets_up.yaml`](../tools-test/dns_targets_up.yaml) |
-| Many unrelated signals in one instant query (`label_replace` + `or`), split into sections in jq | [`tools/estate_overview.yaml`](../tools/estate_overview.yaml) |
-| Finding a VM by host name or address, with or without domain and port | [`tools/vm_metrics.yaml`](../tools/vm_metrics.yaml) |
-| Peak, average and time above a threshold over a window with subqueries | [`tools/vm_steal_time.yaml`](../tools/vm_steal_time.yaml) |
-| The query chosen by an `enum` parameter | [`tools/node_signal_window.yaml`](../tools/node_signal_window.yaml) |
-| Comparison with the same window a week ago | [`tools/pg_slowdown_check.yaml`](../tools/pg_slowdown_check.yaml) |
-| Joint anomalies of three metrics with per-metric thresholds | [`tools/node_disk_pressure_mv.yaml`](../tools/node_disk_pressure_mv.yaml) |
-| Folding segments of many VMs into incidents | [`tools/node_cluster_events.yaml`](../tools/node_cluster_events.yaml) |
-| Summarising a forecast for an interval, durations parsed in jq | [`tools/node_forecast.yaml`](../tools/node_forecast.yaml) |
-| Outliers among pods grouped by cluster and namespace | [`tools/pod_memory_outliers.yaml`](../tools/pod_memory_outliers.yaml) |
+| Two sources in one tool: dig resolves a name, Prometheus says which of its addresses are scraped and up | [`tools-test/dns_targets_up.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools-test/dns_targets_up.yaml) |
+| Many unrelated signals in one instant query (`label_replace` + `or`), split into sections in jq | [`tools/estate_overview.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/estate_overview.yaml) |
+| Finding a VM by host name or address, with or without domain and port | [`tools/vm_metrics.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/vm_metrics.yaml) |
+| Peak, average and time above a threshold over a window with subqueries | [`tools/vm_steal_time.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/vm_steal_time.yaml) |
+| The query chosen by an `enum` parameter | [`tools/node_signal_window.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/node_signal_window.yaml) |
+| Comparison with the same window a week ago | [`tools/pg_slowdown_check.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/pg_slowdown_check.yaml) |
+| Joint anomalies of three metrics with per-metric thresholds | [`tools/node_disk_pressure_mv.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/node_disk_pressure_mv.yaml) |
+| Folding segments of many VMs into incidents | [`tools/node_cluster_events.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/node_cluster_events.yaml) |
+| Summarising a forecast for an interval, durations parsed in jq | [`tools/node_forecast.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/node_forecast.yaml) |
+| Outliers among pods grouped by cluster and namespace | [`tools/pod_memory_outliers.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/pod_memory_outliers.yaml) |
 
 ## Writing the description
 
@@ -1019,7 +999,7 @@ sed 's#^tools_dir:.*#tools_dir: /tmp/check/tools#' config.yaml > /tmp/check/conf
 
 ### Call
 
-[`scripts/mcp-call.py`](../scripts/mcp-call.py) starts the server over stdio, so it needs a config with
+[`scripts/mcp-call.py`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/scripts/mcp-call.py) starts the server over stdio, so it needs a config with
 `server.transport: stdio`:
 
 ```bash
@@ -1122,7 +1102,7 @@ The server reads the catalog only at startup.
 ## Let an AI agent write the tool
 
 The repository includes an agent skill (a `SKILL.md` with reference files, the format Claude Code and other agents load) for this workflow:
-[`skills/ocellus-tool-builder`](../skills/ocellus-tool-builder). With it, an AI coding agent interviews you about
+[`skills/ocellus-tool-builder`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/skills/ocellus-tool-builder). With it, an AI coding agent interviews you about
 the question, the source, the analysis and the answer, and writes the YAML from the closest template. It then offers
 to validate the file with `-validate` and to test-call it. It builds, installs, downloads and runs nothing, and
 queries none of your systems, without your explicit permission; where there is no ocellusai-mcp checkout or binary, it

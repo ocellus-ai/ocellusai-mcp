@@ -1,27 +1,9 @@
 # Processors
 
-[For DevOps](for-devops.md) · [Quick start](quick-start.md) · [User guide](user-guide.md) · [Workers](workers.md) · [Templates and jq](templates-and-jq.md) · **Processors** · [Writing tools](writing-tools.md)
-
 Processors are the analysis part of Ocellus AI. They sit between the data sources and the answer: they reshape data,
 find anomalies in time series, find outliers among peers, fold simultaneous events on many hosts into incidents, and
 decompose a series into trend and cycles to forecast it. This guide explains what each processor does, how it decides,
 what its settings mean, what its report contains and where its limits are.
-
-## Contents
-
-- [How the process stage works](#how-the-process-stage-works)
-- [Data shapes](#data-shapes)
-- [Choosing a processor](#choosing-a-processor)
-- [Concepts shared by the detectors](#concepts-shared-by-the-detectors)
-- [jq](#jq)
-- [join](#join)
-- [anomaly](#anomaly)
-- [outliers](#outliers)
-- [anomaly_mv](#anomaly_mv)
-- [anomaly_ensemble](#anomaly_ensemble)
-- [cluster_events](#cluster_events)
-- [ssa and ssa_mv](#ssa-and-ssa_mv)
-- [Cost](#cost)
 
 ## How the process stage works
 

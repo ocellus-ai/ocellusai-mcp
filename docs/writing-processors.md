@@ -1,7 +1,5 @@
 # Writing a processor
 
-[Architecture](architecture.md) · [Components](components.md) · [Writing a worker](writing-workers.md) · **Writing a processor**
-
 Processors are the analysis part of Ocellus AI: the steps of a tool's `process` section that reshape data, find
 anomalies, compare peers and forecast. This guide explains how to add to them. Often the right addition is smaller
 than a processor: a new detector inside `anomaly` or `anomaly_mv` is one file and one line. The guide covers each
@@ -17,23 +15,6 @@ level with a complete example:
 Every code block of these examples compiles, passes its tests and `golangci-lint`, and the example tools pass
 `-validate`. Read [Architecture](architecture.md) first; what the existing processors do is described for users in
 [Processors](processors.md).
-
-## Contents
-
-- [What to build](#what-to-build)
-- [How the process stage calls a processor](#how-the-process-stage-calls-a-processor)
-- [Rules for processor code](#rules-for-processor-code)
-- [Data shapes](#data-shapes)
-- [Transformations and analyses](#transformations-and-analyses)
-- [Tutorial: a transformation, smooth](#tutorial-a-transformation-smooth)
-- [Tutorial: an analysis, trend](#tutorial-an-analysis-trend)
-- [A detector for anomaly: hampel](#a-detector-for-anomaly-hampel)
-- [A detector for anomaly_mv: zdist](#a-detector-for-anomaly_mv-zdist)
-- [A detector for the anomaly ensemble](#a-detector-for-the-anomaly-ensemble)
-- [Changing SSA](#changing-ssa)
-- [Documentation](#documentation)
-- [Checklist](#checklist)
-- [Common mistakes](#common-mistakes)
 
 ## What to build
 
@@ -1246,9 +1227,9 @@ Update:
 - [`docs/processors.md`](processors.md): a section for a new processor (what it does, its settings, its report, how
   to read it, its limits), a row in *Choosing a processor* and in *Cost*; for a new detector, its entry in the
   processor's *Methods* and settings;
-- [`README.md`](../README.md): the processors table and the feature list;
+- [`README.md`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/README.md): the processors table and the feature list;
 - the processor list in [User guide](user-guide.md) and in [Components](components.md);
-- [`skills/ocellus-tool-builder/reference/processors.md`](../skills/ocellus-tool-builder/reference/processors.md),
+- [`skills/ocellus-tool-builder/reference/processors.md`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/skills/ocellus-tool-builder/reference/processors.md),
   so that agents writing tools know about it.
 
 ## Checklist

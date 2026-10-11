@@ -1,41 +1,9 @@
 # Components
 
-[Architecture](architecture.md) · **Components** · [Writing a worker](writing-workers.md) · [Writing a processor](writing-processors.md)
-
 This guide walks through the packages of Ocellus AI one by one: what each is for, its main types and functions, the
 rules it keeps and how it is tested. Read [Architecture](architecture.md) first for the picture they fit into. What
 the workers and processors do from a user's point of view is in [Workers](workers.md) and
 [Processors](processors.md); this guide is about how they are built.
-
-## Contents
-
-- [cmd/ocellusai-mcp](#cmdocellusai-mcp)
-- [internal/config](#internalconfig)
-- [internal/catalog](#internalcatalog)
-- [internal/template](#internaltemplate)
-- [internal/transform](#internaltransform)
-- [internal/pipeline](#internalpipeline)
-- [internal/server](#internalserver)
-- [internal/worker](#internalworker)
-  - [prometheus](#prometheus)
-  - [shell](#shell)
-  - [rest](#rest)
-- [internal/processor](#internalprocessor)
-  - [series](#series)
-  - [jq](#jq)
-  - [join](#join)
-  - [anomaly](#anomaly)
-  - [outliers](#outliers)
-  - [anomaly_mv](#anomaly_mv)
-  - [anomaly_ensemble](#anomaly_ensemble)
-  - [cluster_events](#cluster_events)
-  - [ssa and ssa_mv](#ssa-and-ssa_mv)
-- [internal/tsanomaly](#internaltsanomaly)
-- [internal/ssa](#internalssa)
-- [Tool catalogs and test data](#tool-catalogs-and-test-data)
-- [Scripts, images and the agent skill](#scripts-images-and-the-agent-skill)
-- [Building, testing and linting](#building-testing-and-linting)
-- [Where to look](#where-to-look)
 
 ## cmd/ocellusai-mcp
 
@@ -157,7 +125,7 @@ Go `text/template` with the Ocellus helpers, used for requests, `with` sections 
   call's values. Cloning keeps the shared template untouched, so concurrent calls do not interfere.
 - `FuncMap()` is sprig's text function map plus `promLabel`, `promRegex`, `promDuration`, `promDurationSeconds`,
   `pathEscape`, and placeholders for `param` and `result` that fail outside execution. A new helper goes here, with a
-  test and a line in [Templates and jq](templates-and-jq.md#helpers-added-by-ocellusai-mcp).
+  test and a line in [Templates and jq](templates-and-jq.md#helpers-added-by-ocellus-ai).
 - `CompileTree(name, v)` compiles a request or `with` section: every string that contains `{{` becomes a template,
   other values stay literals. `Tree.Render(params, results)` returns a copy with every template executed; the root
   `.` of those templates is the parameter map.

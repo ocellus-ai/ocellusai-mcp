@@ -1,7 +1,5 @@
 # Architecture
 
-**Architecture** · [Components](components.md) · [Writing a worker](writing-workers.md) · [Writing a processor](writing-processors.md)
-
 This guide is for people who want to work on Ocellus AI itself: fix a bug, connect a new kind of data source or add a
 new kind of analysis. It explains how the server is put together, what happens when it starts and when an agent
 calls a tool, and which rules hold the parts together. Each package is described in [Components](components.md);
@@ -10,24 +8,6 @@ the two extension points have their own guides, [Writing a worker](writing-worke
 
 The guide assumes you know what a tool file looks like. If not, start with the user documentation:
 [User guide](user-guide.md) and [Writing tools](writing-tools.md).
-
-## Contents
-
-- [In one picture](#in-one-picture)
-- [Design principles](#design-principles)
-- [Startup](#startup)
-- [A tool call](#a-tool-call)
-- [Data between stages](#data-between-stages)
-- [Load time and call time](#load-time-and-call-time)
-- [Types, instances and registries](#types-instances-and-registries)
-- [Errors](#errors)
-- [Concurrency and cancellation](#concurrency-and-cancellation)
-- [Trust and security boundaries](#trust-and-security-boundaries)
-- [Logging](#logging)
-- [Repository layout](#repository-layout)
-- [Dependencies](#dependencies)
-- [Decisions and their reasons](#decisions-and-their-reasons)
-- [What is not there yet](#what-is-not-there-yet)
 
 ## In one picture
 

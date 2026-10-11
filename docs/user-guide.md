@@ -1,26 +1,8 @@
 # User guide
 
-[For DevOps](for-devops.md) · [Quick start](quick-start.md) · **User guide** · [Workers](workers.md) · [Templates and jq](templates-and-jq.md) · [Processors](processors.md) · [Writing tools](writing-tools.md)
-
 This guide is for the people who install, configure and run Ocellus AI, and for those who use its tools through an
 AI agent and want to understand what they get back. It assumes you have been through the
 [Quick start](quick-start.md) or know how to build the binary.
-
-## Contents
-
-- [How Ocellus AI works](#how-ocellusai-mcp-works)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Running the server](#running-the-server)
-- [Transports](#transports)
-- [The tool catalog](#the-tool-catalog)
-- [What the agent receives](#what-the-agent-receives)
-- [The bundled tools](#the-bundled-tools)
-- [Time, windows and history](#time-windows-and-history)
-- [Performance and limits](#performance-and-limits)
-- [Deploying to Kubernetes](#deploying-to-kubernetes)
-- [Security model](#security-model)
-- [Troubleshooting](#troubleshooting)
 
 ## How Ocellus AI works
 
@@ -87,7 +69,7 @@ Other `make` targets:
 
 ### Container image
 
-The [`Dockerfile`](../Dockerfile) builds a distroless static image that runs as non-root (uid 65532) and holds the
+The [`Dockerfile`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/Dockerfile) builds a distroless static image that runs as non-root (uid 65532) and holds the
 binary, `/app/tools` (the working catalog) and `/app/config.yaml` (the example config):
 
 ```bash
@@ -151,7 +133,7 @@ log:
 | `log.level` | `info` | `debug` adds the rendered request of every call and a line per processing step. |
 | `log.format` | `json` | `json` or `text`. Logs always go to stderr. |
 
-The example config ([`config.example.yaml`](../config.example.yaml)) sets `transport: http`; a config that omits
+The example config ([`config.example.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/config.example.yaml)) sets `transport: http`; a config that omits
 `server` entirely gets `stdio`.
 
 ### Environment variables in the config
@@ -174,7 +156,7 @@ workers:
   YAML would read it. Inside flow collections (`[...]`, `{...}`) put the reference in quotes.
 - A list cannot come from one variable: write lists such as `allowlist` in the file.
 
-[`config.env.yaml`](../config.env.yaml) is a complete config where every setting comes from the environment, for
+[`config.env.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/config.env.yaml) is a complete config where every setting comes from the environment, for
 container platforms and Helm charts.
 
 ### Strict parsing
@@ -287,7 +269,7 @@ curl -s -X POST localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"vm_metrics","arguments":{"name":"db-02"}}}'
 ```
 
-For everyday testing [`scripts/mcp-call.py`](../scripts/mcp-call.py) is simpler; it uses stdio (see the
+For everyday testing [`scripts/mcp-call.py`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/scripts/mcp-call.py) is simpler; it uses stdio (see the
 [Quick start](quick-start.md#calling-tools-without-an-agent)).
 
 ### The HTTP transport has no authentication
@@ -348,8 +330,8 @@ The repository has three sets:
 
 | Directory | What it is |
 |---|---|
-| [`tools/`](../tools) | **The working catalog**: 23 tools for a monitored estate. The example config, the image and the Kubernetes manifest load it. |
-| [`tools-test/`](../tools-test) | 13 small reference tools, one feature each. The test suite runs them against mocked Prometheus, Alertmanager and `dig`; they also work against the real ones. |
+| [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) | **The working catalog**: 23 tools for a monitored estate. The example config, the image and the Kubernetes manifest load it. |
+| [`tools-test/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools-test) | 13 small reference tools, one feature each. The test suite runs them against mocked Prometheus, Alertmanager and `dig`; they also work against the real ones. |
 | `internal/processor/*/testdata/` | Four analysis examples used by end-to-end tests: `vm_anomaly_ensemble`, `vm_multivariate_anomalies`, `vm_cpu_forecast`, `vm_cpu_mem_mssa`. |
 
 To serve tools from several places, copy the files you want into one directory: a server loads exactly one
@@ -410,7 +392,7 @@ for whoever maintains the catalog.
 
 ## The bundled tools
 
-The working catalog in [`tools/`](../tools) covers a typical estate: virtual machines with node_exporter, Kubernetes,
+The working catalog in [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) covers a typical estate: virtual machines with node_exporter, Kubernetes,
 PostgreSQL, Kafka, HAProxy and blackbox probes. Every file starts with a comment that says what the tool assumes about
 your data; the [Quick start](quick-start.md#4-match-the-catalog-to-your-labels) lists the label names to check.
 
@@ -476,7 +458,7 @@ your data; the [Quick start](quick-start.md#4-match-the-catalog-to-your-labels) 
 
 ### The reference tools
 
-[`tools-test/`](../tools-test) shows each feature on a small scale. Some need more than Prometheus:
+[`tools-test/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools-test) shows each feature on a small scale. Some need more than Prometheus:
 
 | Tools | Need |
 |---|---|
@@ -525,7 +507,7 @@ loop loads your Prometheus accordingly.
 
 ## Deploying to Kubernetes
 
-[`deploy/k8s.yaml`](../deploy/k8s.yaml) contains:
+[`deploy/k8s.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/deploy/k8s.yaml) contains:
 
 - a `ConfigMap` `ocellusai-mcp-config` with `config.yaml` (HTTP on `:8080`, Prometheus, an Alertmanager `rest`
   instance);

@@ -1,26 +1,11 @@
 # Templates and jq
 
-[For DevOps](for-devops.md) · [Quick start](quick-start.md) · [User guide](user-guide.md) · [Workers](workers.md) · **Templates and jq** · [Processors](processors.md) · [Writing tools](writing-tools.md)
-
 A tool file mixes three languages. YAML gives it structure. **Go templates** build the requests sent to the sources
 and the text the agent reads. **jq** reshapes JSON between the steps. This guide teaches both languages as they are
 used in tool files, so that you can read any tool and change what it asks and answers.
 
 The worker requests are described in [Workers](workers.md), the analysis steps in [Processors](processors.md), and
 how to design and write a whole tool in [Writing tools](writing-tools.md).
-
-## Contents
-
-- [A tool file at a glance](#a-tool-file-at-a-glance)
-- [Parameters](#parameters)
-- [Go templates](#go-templates)
-- [Writing PromQL safely](#writing-promql-safely)
-- [Template recipes](#template-recipes)
-- [jq](#jq)
-- [Results of earlier calls](#results-of-earlier-calls)
-- [The answer text](#the-answer-text)
-- [Reading a tool: a walkthrough](#reading-a-tool-a-walkthrough)
-- [Debugging](#debugging)
 
 ## A tool file at a glance
 
@@ -464,7 +449,7 @@ response:
 - `default "__none__"` matters: with an empty list, the regex would match every series **without** an `instance`
   label; `__none__` matches nothing.
 - `$up[.]` is `null` for an address Prometheus does not scrape, so it stays in the list. With several targets on one
-  address this short join keeps one of them; [`tools-test/dns_targets_up.yaml`](../tools-test/dns_targets_up.yaml)
+  address this short join keeps one of them; [`tools-test/dns_targets_up.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools-test/dns_targets_up.yaml)
   keeps them all.
 
 ## The answer text
@@ -505,7 +490,7 @@ Rules that keep `render` from failing or misleading:
 
 ## Reading a tool: a walkthrough
 
-[`tools/pod_memory_outliers.yaml`](../tools/pod_memory_outliers.yaml) uses every language in a few lines. It finds
+[`tools/pod_memory_outliers.yaml`](https://github.com/ocellus-ai/ocellusai-mcp/blob/main/tools/pod_memory_outliers.yaml) uses every language in a few lines. It finds
 pods whose memory stands out from the other pods of the same namespace.
 
 ```yaml

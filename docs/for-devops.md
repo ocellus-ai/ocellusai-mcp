@@ -1,7 +1,5 @@
 # For DevOps engineers
 
-**For DevOps** · [Quick start](quick-start.md) · [User guide](user-guide.md) · [Workers](workers.md) · [Templates and jq](templates-and-jq.md) · [Processors](processors.md) · [Writing tools](writing-tools.md)
-
 This page is for engineers who run infrastructure: VMs, Kubernetes, databases, queues, a Prometheus with exporters.
 It explains in practical terms what Ocellus AI lets you do, where it saves time, and where it does not help. You need
 no background in statistics or programming to read it; the few analysis terms you will meet in answers are explained
@@ -12,18 +10,6 @@ ready-made tools over your monitoring. When you ask the assistant a question suc
 on the database hosts last night?", it calls a tool; the tool queries Prometheus, Kubernetes or an API, runs the
 analysis on the server and returns a few lines of findings: when, on which host, which metric, how far from its usual
 level. The assistant reads those lines and answers you.
-
-## Contents
-
-- [The gap it fills](#the-gap-it-fills)
-- [What you can do with it](#what-you-can-do-with-it)
-- [Everyday scenarios](#everyday-scenarios)
-- [How it fits with what you already have](#how-it-fits-with-what-you-already-have)
-- [Why the answers can be trusted, and how far](#why-the-answers-can-be-trusted-and-how-far)
-- [Safety and control](#safety-and-control)
-- [What it does not do](#what-it-does-not-do)
-- [What it takes to try](#what-it-takes-to-try)
-- [Words you will see in answers](#words-you-will-see-in-answers)
 
 ## The gap it fills
 
@@ -50,7 +36,7 @@ answer to you.
 
 ## What you can do with it
 
-The working catalog in [`tools/`](../tools) has 23 tools for a typical estate: VMs with node_exporter, Kubernetes with
+The working catalog in [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) has 23 tools for a typical estate: VMs with node_exporter, Kubernetes with
 kube-state-metrics, PostgreSQL, Kafka, HAProxy and blackbox probes. The sections below group them by the question
 they answer. You don't call tools by name: you ask, and the assistant picks a tool by its description.
 
