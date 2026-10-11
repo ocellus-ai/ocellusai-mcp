@@ -1,0 +1,12 @@
+$schema: https://api.gitbook.com/gitbook-docs.yaml
+site:
+  title: Ocellus AI
+  structure:
+    - type: space
+      key: ocellus-ai
+      title: Ocellus AI
+      path: ocellus-ai
+      default: true
+      content:
+        directory: ./docs
+        language: en
