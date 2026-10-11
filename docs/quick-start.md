@@ -121,7 +121,7 @@ assumptions are:
 | `pod_memory_usage`, `pod_memory_outliers` | cAdvisor metrics; the outlier tool expects `job="kubelet"` and a `cluster` label |
 | `alerts_firing`, `estate_overview` (alerts) | alerting rules evaluated by this Prometheus (the `ALERTS` series) |
 | `pg_xact_anomalies` | postgres_exporter as `job="postgres-exporter"` |
-| `pg_slowdown_check` | postgres_exporter and node_exporter on the same host, found by the host name in `instance` |
+| `pg_slowdown_check`, `pg_server_load` | postgres_exporter and node_exporter on the same host, found by the host name in `instance` |
 | `kafka_lag_anomalies` | kafka_exporter (`kafka_consumergroup_lag`) |
 | `haproxy_backend_health` | haproxy_exporter as `job="haproxy-exporter"` |
 

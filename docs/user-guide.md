@@ -330,7 +330,7 @@ The repository has three sets:
 
 | Directory | What it is |
 |---|---|
-| [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) | **The working catalog**: 23 tools for a monitored estate. The example config, the image and the Kubernetes manifest load it. |
+| [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) | **The working catalog**: 24 tools for a monitored estate. The example config, the image and the Kubernetes manifest load it. |
 | [`tools-test/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools-test) | 13 small reference tools, one feature each. The test suite runs them against mocked Prometheus, Alertmanager and `dig`; they also work against the real ones. |
 | `internal/processor/*/testdata/` | Four analysis examples used by end-to-end tests: `vm_anomaly_ensemble`, `vm_multivariate_anomalies`, `vm_cpu_forecast`, `vm_cpu_mem_mssa`. |
 
@@ -408,6 +408,7 @@ your data; the [Quick start](quick-start.md#4-match-the-catalog-to-your-labels) 
 | `pod_memory_usage` | Top pods by working-set memory in a namespace. | `namespace`, `pod`, `top` |
 | `pod_restarts` | Containers that restarted within a window. | `namespace`, `window` (1h) |
 | `pg_slowdown_check` | Why is this PostgreSQL server slow? Host, database and replication signals against the same window a week earlier, with reading hints. | `host`, `window` (1h), `compare` (7d) |
+| `pg_server_load` | How loaded is this PostgreSQL server, and what is the bottleneck? Host and database signals over a window, each graded from low to critical against fixed thresholds. | `host`, `window` (1d), `at` |
 | `haproxy_backend_health` | Which HAProxy backend has errors, queues or slow responses? | `instance`, `proxy`, `window` (5m) |
 
 ### Anomalies in each object's own history

@@ -36,7 +36,7 @@ answer to you.
 
 ## What you can do with it
 
-The working catalog in [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) has 23 tools for a typical estate: VMs with node_exporter, Kubernetes with
+The working catalog in [`tools/`](https://github.com/ocellus-ai/ocellusai-mcp/tree/main/tools) has 24 tools for a typical estate: VMs with node_exporter, Kubernetes with
 kube-state-metrics, PostgreSQL, Kafka, HAProxy and blackbox probes. The sections below group them by the question
 they answer. You don't call tools by name: you ask, and the assistant picks a tool by its description.
 
